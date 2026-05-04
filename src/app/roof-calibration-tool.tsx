@@ -24,6 +24,7 @@ type AttachedGaragePolicy = "include" | "exclude";
 type DwellingType = "Single detached" | "Duplex";
 type EstimateStatus = "Loaded" | "Estimating" | "Estimated" | "No footprint" | "Error";
 type AgeBand = "Pre-1950" | "1950-1969" | "1970-1989" | "1990-2009" | "2010+" | "Unknown";
+type Language = "en" | "zh";
 type StructureRole =
   | "Main roof"
   | "Attached roof candidate"
@@ -144,8 +145,24 @@ type BatchResult = {
   status: EstimateStatus;
 };
 
+type AddressTableColumnKey =
+  | "dwellingType"
+  | "year"
+  | "ageBand"
+  | "landUse"
+  | "roofSqft"
+  | "squares"
+  | "confidence"
+  | "expectedError"
+  | "flags"
+  | "status"
+  | "view";
+
+type LocalizedText = Record<Language, string>;
+
 const SOCRATA_ENDPOINT = "https://data.calgary.ca/resource/4bsw-nn7w.json";
 const SQM_TO_SQFT = 10.7639;
+const MAX_ELIGIBLE_ADDRESSES = 100;
 const DEFAULT_ASSUMPTIONS: CommunityAssumptions = {
   pitch: "6/12",
   overhangInches: 12,
@@ -181,6 +198,178 @@ const PITCH_OPTIONS: Array<{ label: PitchValue; multiplier: number }> = [
   { label: "10/12", multiplier: 1.302 },
   { label: "12/12", multiplier: 1.414 },
 ];
+const ADDRESS_TABLE_COLUMNS: Array<{ key: AddressTableColumnKey; label: LocalizedText }> = [
+  { key: "dwellingType", label: { en: "Dwelling", zh: "住宅类型" } },
+  { key: "year", label: { en: "Year", zh: "年份" } },
+  { key: "ageBand", label: { en: "Age", zh: "屋龄" } },
+  { key: "landUse", label: { en: "Land use", zh: "土地用途" } },
+  { key: "roofSqft", label: { en: "Roof sqft", zh: "屋顶面积" } },
+  { key: "squares", label: { en: "Squares", zh: "屋面方" } },
+  { key: "confidence", label: { en: "Confidence", zh: "可信度" } },
+  { key: "expectedError", label: { en: "Error", zh: "误差" } },
+  { key: "flags", label: { en: "Flags", zh: "提示" } },
+  { key: "status", label: { en: "Status", zh: "状态" } },
+  { key: "view", label: { en: "View", zh: "查看" } },
+];
+
+const UI_COPY = {
+  en: {
+    languageLabel: "Language",
+    languageButton: "中文",
+    title: "Roof Sqft Calibration Tool",
+    subtitle:
+      `Draw a Calgary block or cluster of houses, load up to ${MAX_ELIGIBLE_ADDRESSES} eligible residential parcels, then estimate each roof from Mapbox building footprints and Turf area calculations.`,
+    metrics: {
+      eligibleRows: "Eligible rows",
+      estimated: "Estimated",
+      noFootprint: "No footprint",
+      batchSquares: "Batch squares",
+    },
+    drawPanel: "1. Draw houses to load",
+    drawArea: "Draw area",
+    drawInstruction: `Draw a polygon around the houses to load. Max ${MAX_ELIGIBLE_ADDRESSES} eligible rows.`,
+    drawActive: "Click points on the map, then click the first point to close the area.",
+    clear: "Clear",
+    maxLoad: "Max load",
+    drawnArea: "Drawn area",
+    loadedRows: "Loaded rows",
+    selectedSource: "Selected source",
+    none: "None",
+    houses: "houses",
+    calgaryOpenData: "Calgary open data",
+    parametersPanel: "2. Community parameters",
+    defaultPitch: "Default pitch",
+    overhang: "Overhang inches",
+    calibration: "Calibration percent",
+    wasteFactor: "Waste factor",
+    detachedGarage: "Detached garage",
+    attachedGarage: "Attached garage",
+    includeDuplexes: "Include duplexes",
+    includeR120: "Yes, include R120",
+    r110Only: "No, R110 only",
+    include: "Include",
+    exclude: "Exclude",
+    auto: "Auto",
+    exclusionRule:
+      "Exclusion rule: townhouse, rowhouse, condo, apartment, commercial, industrial, multi-unit, and non-residential rows are excluded because only RE + R110/R120 rows are loaded.",
+    loadPanel: "3. Load and run",
+    loadAndRun: "Load houses + run estimate",
+    loadingSelected: "Loading houses",
+    runningBatch: "Running estimate",
+    exportCsv: "Export CSV",
+    mapView: "Map view",
+    mapboxRequired: "Mapbox token required.",
+    duplexLegend: "Blue outlines mark duplex rows.",
+    addressTable: "Address table",
+    columns: "Columns",
+    address: "Address",
+    viewButton: "View",
+    emptyTable:
+      `Draw an area on the map and load up to ${MAX_ELIGIBLE_ADDRESSES} eligible Calgary houses. No pasted address list is needed.`,
+    selectedAddress: "Selected address",
+    selectedEmpty:
+      "Draw an area and select an address row to inspect source data, assumptions, structures, and overrides.",
+    roofSqft: "Roof sqft",
+    roofingSquares: "Roofing squares",
+    confidence: "Confidence",
+    structures: "Structures",
+    source: "Source",
+    landUse: "Land use",
+    assessment: "assessment",
+    uniqueKey: "unique key",
+    unknown: "unknown",
+    notSupplied: "not supplied",
+    pitchOverride: "Pitch override",
+    notes: "Notes",
+    notesPlaceholder: "Saved automatically to this browser",
+    roofStructures: "Included/excluded roof structures",
+    noFootprintAttached: "No Mapbox building footprint has been attached to this row yet.",
+    structure: "Structure",
+    included: "Included",
+    excluded: "Excluded",
+    flags: "Flags",
+    assumptions: "Assumptions",
+    sqft: "sqft",
+    inOut: "in / {out} out",
+  },
+  zh: {
+    languageLabel: "语言",
+    languageButton: "English",
+    title: "屋顶面积校准工具",
+    subtitle:
+      `在卡尔加里地图上圈选一个街区，载入最多 ${MAX_ELIGIBLE_ADDRESSES} 个符合条件的住宅地块，并用 Mapbox 建筑轮廓和 Turf 面积计算估算每个屋顶。`,
+    metrics: {
+      eligibleRows: "符合条件",
+      estimated: "已估算",
+      noFootprint: "无轮廓",
+      batchSquares: "屋面方数",
+    },
+    drawPanel: "1. 圈选房屋",
+    drawArea: "圈选区域",
+    drawInstruction: `在地图上圈选要载入的住宅区域。最多 ${MAX_ELIGIBLE_ADDRESSES} 条记录。`,
+    drawActive: "在地图上点击各个点，然后点击第一个点来闭合区域。",
+    clear: "清除",
+    maxLoad: "最多载入",
+    drawnArea: "已圈区域",
+    loadedRows: "已载入",
+    selectedSource: "数据来源",
+    none: "无",
+    houses: "套住宅",
+    calgaryOpenData: "卡尔加里开放数据",
+    parametersPanel: "2. 社区参数",
+    defaultPitch: "默认坡度",
+    overhang: "屋檐外挑（英寸）",
+    calibration: "校准比例",
+    wasteFactor: "损耗比例",
+    detachedGarage: "独立车库",
+    attachedGarage: "连体车库",
+    includeDuplexes: "包含双拼",
+    includeR120: "是，包含 R120",
+    r110Only: "否，仅 R110",
+    include: "包含",
+    exclude: "排除",
+    auto: "自动",
+    exclusionRule:
+      "排除规则：联排、公寓、商业、工业、多户和非住宅记录会被排除；系统只载入 RE + R110/R120 住宅记录。",
+    loadPanel: "3. 载入并估算",
+    loadAndRun: "载入住宅并估算",
+    loadingSelected: "正在载入住宅",
+    runningBatch: "正在估算",
+    exportCsv: "导出 CSV",
+    mapView: "地图视图",
+    mapboxRequired: "需要 Mapbox token。",
+    duplexLegend: "蓝色边线表示双拼记录。",
+    addressTable: "地址表",
+    columns: "列",
+    address: "地址",
+    viewButton: "查看",
+    emptyTable: `请先在地图上圈选区域并载入最多 ${MAX_ELIGIBLE_ADDRESSES} 个卡尔加里住宅地址。`,
+    selectedAddress: "选中地址",
+    selectedEmpty: "圈选区域并选择一个地址后，可查看来源数据、假设、结构和手动覆盖。",
+    roofSqft: "屋顶面积",
+    roofingSquares: "屋面方",
+    confidence: "可信度",
+    structures: "结构",
+    source: "来源",
+    landUse: "土地用途",
+    assessment: "评估类别",
+    uniqueKey: "唯一编号",
+    unknown: "未知",
+    notSupplied: "未提供",
+    pitchOverride: "坡度覆盖",
+    notes: "备注",
+    notesPlaceholder: "自动保存到此浏览器",
+    roofStructures: "包含/排除的屋顶结构",
+    noFootprintAttached: "此记录尚未匹配到 Mapbox 建筑轮廓。",
+    structure: "结构",
+    included: "已包含",
+    excluded: "已排除",
+    flags: "提示",
+    assumptions: "假设",
+    sqft: "平方英尺",
+    inOut: "包含 / 排除 {out}",
+  },
+} satisfies Record<Language, Record<string, unknown>>;
 
 function pitchMultiplierFor(pitch: PitchValue) {
   return PITCH_OPTIONS.find((option) => option.label === pitch)?.multiplier ?? 1.118;
@@ -191,6 +380,45 @@ function formatNumber(value: number, digits = 0) {
     maximumFractionDigits: digits,
     minimumFractionDigits: digits,
   }).format(value);
+}
+
+function localizeDwellingType(value: DwellingType, language: Language) {
+  if (language === "en") {
+    return value;
+  }
+
+  return value === "Duplex" ? "双拼" : "独立屋";
+}
+
+function localizeConfidence(value: Confidence, language: Language) {
+  if (language === "en") {
+    return value;
+  }
+
+  const labels = {
+    High: "高",
+    Medium: "中",
+    Low: "低",
+    Unusable: "不可用",
+  } satisfies Record<Confidence, string>;
+
+  return labels[value];
+}
+
+function localizeStatus(value: EstimateStatus, language: Language) {
+  if (language === "en") {
+    return value;
+  }
+
+  const labels = {
+    Loaded: "已载入",
+    Estimating: "估算中",
+    Estimated: "已估算",
+    "No footprint": "无轮廓",
+    Error: "错误",
+  } satisfies Record<EstimateStatus, string>;
+
+  return labels[value];
 }
 
 function csvEscape(value: unknown) {
@@ -364,22 +592,24 @@ function applyOverhang(feature: RoofFeature, overhangInches: number): RoofFeatur
 
 function classifyStructure({
   areaSqft,
-  distanceFromAddressMeters,
   containsAddressPoint,
-  index,
+  centerInParcel,
+  isMainCandidate,
 }: {
   areaSqft: number;
-  distanceFromAddressMeters: number;
   containsAddressPoint: boolean;
-  index: number;
+  centerInParcel: boolean;
+  isMainCandidate: boolean;
 }): { role: StructureRole; included: boolean; includeReason: string } {
-  if (index === 0) {
+  if (isMainCandidate) {
     return {
       role: "Main roof",
       included: true,
       includeReason: containsAddressPoint
-        ? "Closest footprint contains the Calgary parcel centroid."
-        : "Closest footprint to the Calgary parcel centroid.",
+        ? "Selected footprint contains the Calgary parcel centroid."
+        : centerInParcel
+          ? "Largest parcel-contained footprint selected as the main roof."
+          : "Best available footprint selected as the main roof.",
     };
   }
 
@@ -391,19 +621,11 @@ function classifyStructure({
     };
   }
 
-  if (distanceFromAddressMeters <= 16 && areaSqft >= 280 && areaSqft <= 1200) {
-    return {
-      role: "Attached roof candidate",
-      included: true,
-      includeReason: "Close garage-scale footprint included as likely attached roof area.",
-    };
-  }
-
   if (areaSqft >= 280 && areaSqft <= 1100) {
     return {
       role: "Detached garage candidate",
       included: false,
-      includeReason: "Garage-scale footprint excluded unless detached garages are included.",
+      includeReason: "Garage-scale secondary footprint excluded from the automatic total.",
     };
   }
 
@@ -428,6 +650,7 @@ function waitForMapIdle(map: mapboxgl.Map) {
 function findBuildingFootprints(
   map: mapboxgl.Map,
   coordinates: [number, number],
+  parcel: ParcelFeature | null,
 ): AutoEstimateResult {
   const buildingLayers = map.getLayer(BUILDING_FOOTPRINT_LAYER_ID)
     ? [BUILDING_FOOTPRINT_LAYER_ID]
@@ -444,9 +667,31 @@ function findBuildingFootprints(
   }
 
   const centerPoint = map.project(coordinates);
+  const parcelBounds = parcel ? turfBbox(parcel) : null;
+  const projectedParcelBounds = parcelBounds
+    ? [
+        map.project([parcelBounds[0], parcelBounds[1]]),
+        map.project([parcelBounds[2], parcelBounds[3]]),
+      ]
+    : null;
+  const queryPadding = parcelBounds ? 32 : 130;
   const queryBox: [[number, number], [number, number]] = [
-    [centerPoint.x - 130, centerPoint.y - 130],
-    [centerPoint.x + 130, centerPoint.y + 130],
+    [
+      projectedParcelBounds
+        ? Math.min(projectedParcelBounds[0].x, projectedParcelBounds[1].x) - queryPadding
+        : centerPoint.x - queryPadding,
+      projectedParcelBounds
+        ? Math.min(projectedParcelBounds[0].y, projectedParcelBounds[1].y) - queryPadding
+        : centerPoint.y - queryPadding,
+    ],
+    [
+      projectedParcelBounds
+        ? Math.max(projectedParcelBounds[0].x, projectedParcelBounds[1].x) + queryPadding
+        : centerPoint.x + queryPadding,
+      projectedParcelBounds
+        ? Math.max(projectedParcelBounds[0].y, projectedParcelBounds[1].y) + queryPadding
+        : centerPoint.y + queryPadding,
+    ],
   ];
   const renderedFeatures = map.queryRenderedFeatures(queryBox, {
     layers: buildingLayers,
@@ -471,18 +716,33 @@ function findBuildingFootprints(
         properties: {},
         geometry,
       };
+      const roofCenter = turfCenter(roofFeature);
+      const containsAddressPoint = booleanPointInPolygon(addressPoint, roofFeature);
+      const centerInParcel = parcel ? booleanPointInPolygon(roofCenter, parcel) : false;
 
       return {
         feature: roofFeature,
-        containsAddressPoint: booleanPointInPolygon(addressPoint, roofFeature),
+        containsAddressPoint,
+        centerInParcel,
         areaSqft: turfArea(roofFeature) * SQM_TO_SQFT,
         distanceFromAddressMeters:
-          turfDistance(addressPoint, turfCenter(roofFeature), { units: "kilometers" }) * 1000,
+          turfDistance(addressPoint, roofCenter, { units: "kilometers" }) * 1000,
       };
     })
     .filter((candidate): candidate is NonNullable<typeof candidate> => candidate !== null)
     .filter((candidate) => candidate.areaSqft >= 120 && candidate.areaSqft <= 20000)
+    .filter((candidate) =>
+      parcel ? candidate.containsAddressPoint || candidate.centerInParcel : true,
+    )
     .sort((a, b) => {
+      if (parcel) {
+        if (a.centerInParcel !== b.centerInParcel) {
+          return a.centerInParcel ? -1 : 1;
+        }
+
+        return b.areaSqft - a.areaSqft;
+      }
+
       if (a.containsAddressPoint !== b.containsAddressPoint) {
         return a.containsAddressPoint ? -1 : 1;
       }
@@ -497,21 +757,31 @@ function findBuildingFootprints(
     };
   }
 
+  const mainCandidate = candidates.reduce((best, candidate) => {
+    if (!best) {
+      return candidate;
+    }
+
+    if (parcel) {
+      return candidate.areaSqft > best.areaSqft ? candidate : best;
+    }
+
+    if (candidate.containsAddressPoint !== best.containsAddressPoint) {
+      return candidate.containsAddressPoint ? candidate : best;
+    }
+
+    return candidate.distanceFromAddressMeters < best.distanceFromAddressMeters ? candidate : best;
+  }, null as (typeof candidates)[number] | null);
   const selectedCandidates = candidates
-    .filter(
-      (candidate, index) =>
-        index === 0 ||
-        candidate.containsAddressPoint ||
-        candidate.distanceFromAddressMeters <= 45,
-    )
+    .filter((candidate) => candidate === mainCandidate || candidate.areaSqft <= 1100)
     .slice(0, 6);
 
   const facets = selectedCandidates.map((candidate, index) => {
     const classification = classifyStructure({
       areaSqft: candidate.areaSqft,
-      distanceFromAddressMeters: candidate.distanceFromAddressMeters,
       containsAddressPoint: candidate.containsAddressPoint,
-      index,
+      centerInParcel: candidate.centerInParcel,
+      isMainCandidate: candidate === mainCandidate,
     });
 
     return {
@@ -522,6 +792,7 @@ function findBuildingFootprints(
         properties: {
           ...(candidate.feature.properties ?? {}),
           distanceFromAddressMeters: candidate.distanceFromAddressMeters,
+          centerInParcel: candidate.centerInParcel,
         },
       },
       pitch: DEFAULT_ASSUMPTIONS.pitch,
@@ -537,8 +808,8 @@ function findBuildingFootprints(
     facets,
     source:
       facets.length === 1
-        ? "Mapbox building footprint found at the Calgary parcel centroid."
-        : `Found ${facets.length} nearby Mapbox building footprints. Closest structure is included by default.`,
+        ? "Mapbox building footprint selected inside the Calgary parcel."
+        : `Found ${facets.length} parcel-filtered Mapbox building footprints. Largest main roof is included; garage-scale secondary footprints are excluded.`,
   };
 }
 
@@ -852,11 +1123,14 @@ export default function RoofCalibrationTool() {
   const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
   const [selectedAddressId, setSelectedAddressId] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<Record<string, HouseOverride>>({});
-  const [drawMessage, setDrawMessage] = useState("Draw a polygon around the houses to load. Max 50 eligible rows.");
+  const [drawMessage, setDrawMessage] = useState("");
   const [addressMessage, setAddressMessage] = useState("");
   const [batchMessage, setBatchMessage] = useState("");
   const [isLoadingAddresses, setIsLoadingAddresses] = useState(false);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
+  const [hiddenAddressColumns, setHiddenAddressColumns] = useState<AddressTableColumnKey[]>([]);
+  const [language, setLanguage] = useState<Language>("en");
+  const copy = UI_COPY[language];
 
   const selectedResult =
     batchResults.find((result) => result.id === selectedAddressId) ??
@@ -865,6 +1139,11 @@ export default function RoofCalibrationTool() {
       : batchResults.find((result) => result.status === "Estimated") ?? batchResults[0] ?? null);
   const selectedOverride = selectedResult ? overrides[selectedResult.id] ?? {} : {};
   const estimatedCount = batchResults.filter((result) => result.status === "Estimated").length;
+  const visibleAddressColumnCount = 1 + ADDRESS_TABLE_COLUMNS.length - hiddenAddressColumns.length;
+  const isAddressColumnVisible = useCallback(
+    (key: AddressTableColumnKey) => !hiddenAddressColumns.includes(key),
+    [hiddenAddressColumns],
+  );
   const noFootprintCount = batchResults.filter((result) => result.status === "No footprint").length;
 
   const totals = useMemo(() => {
@@ -892,20 +1171,22 @@ export default function RoofCalibrationTool() {
 
     if (!polygon) {
       setDrawnAreaGeometry(null);
-      setDrawMessage("Draw a polygon around the houses to load. Max 50 eligible rows.");
+      setDrawMessage("");
       return;
     }
 
     setDrawnAreaGeometry(polygon.geometry);
     setDrawMessage(
-      `Area drawn. Approx ${formatNumber(turfArea(polygon) / 1_000_000, 3)} sq km. Ready to load up to 50 eligible houses.`,
+      language === "en"
+        ? `Area drawn. Approx ${formatNumber(turfArea(polygon) / 1_000_000, 3)} sq km. Ready to load up to ${MAX_ELIGIBLE_ADDRESSES} eligible houses.`
+        : `已圈选区域，约 ${formatNumber(turfArea(polygon) / 1_000_000, 3)} 平方公里。可以载入最多 ${MAX_ELIGIBLE_ADDRESSES} 套住宅。`,
     );
     setEligibleAddresses([]);
     setBatchResults([]);
     setSelectedAddressId(null);
     setAddressMessage("");
     setBatchMessage("");
-  }, []);
+  }, [language]);
 
   useEffect(() => {
     try {
@@ -1176,12 +1457,16 @@ export default function RoofCalibrationTool() {
 
   const loadEligibleAddresses = async () => {
     if (!drawnAreaGeometry) {
-      setAddressMessage("Draw an area on the map first.");
-      return;
+      setAddressMessage(language === "en" ? "Draw an area on the map first." : "请先在地图上圈选区域。");
+      return [] satisfies EligibleAddress[];
     }
 
     setIsLoadingAddresses(true);
-    setAddressMessage("Loading up to 50 eligible Calgary assessment rows inside the drawn area...");
+    setAddressMessage(
+      language === "en"
+        ? `Loading up to ${MAX_ELIGIBLE_ADDRESSES} eligible Calgary assessment rows inside the drawn area...`
+        : `正在载入圈选区域内最多 ${MAX_ELIGIBLE_ADDRESSES} 条符合条件的卡尔加里评估记录...`,
+    );
     setBatchMessage("");
     setSelectedAddressId(null);
 
@@ -1199,7 +1484,7 @@ export default function RoofCalibrationTool() {
           "address,comm_name,year_of_construction,land_use_designation,property_type,sub_property_use,assessment_class,assessment_class_description,multipolygon,unique_key,cpid,roll_number",
         $where: where,
         $order: "comm_name,address",
-        $limit: 50,
+        $limit: MAX_ELIGIBLE_ADDRESSES,
       });
       const response = await fetch(url);
 
@@ -1228,36 +1513,52 @@ export default function RoofCalibrationTool() {
       );
       setSelectedAddressId(addresses[0]?.id ?? null);
       setAddressMessage(
-        `Loaded ${addresses.length} eligible addresses inside the drawn area. Max 50. Filtered to residential R110 single detached${assumptions.includeDuplexes ? " and R120 duplex" : ""} rows only.`,
+        language === "en"
+          ? `Loaded ${addresses.length} eligible addresses inside the drawn area. Max ${MAX_ELIGIBLE_ADDRESSES}. Filtered to residential R110 single detached${assumptions.includeDuplexes ? " and R120 duplex" : ""} rows only.`
+          : `已载入 ${addresses.length} 个符合条件的地址。最多 ${MAX_ELIGIBLE_ADDRESSES} 个；仅筛选住宅 R110 独立屋${assumptions.includeDuplexes ? "和 R120 双拼" : ""}记录。`,
       );
+      return addresses;
     } catch (error) {
       setAddressMessage(
         error instanceof Error
           ? error.message
-          : "Unable to load eligible Calgary addresses.",
+          : language === "en"
+            ? "Unable to load eligible Calgary addresses."
+            : "无法载入符合条件的卡尔加里地址。",
       );
+      return [] satisfies EligibleAddress[];
     } finally {
       setIsLoadingAddresses(false);
     }
   };
 
-  const runBatchEstimate = async () => {
+  const runBatchEstimate = async (addressesToEstimate = eligibleAddresses) => {
     const map = mapRef.current;
 
     if (!map || !mapReady || !mapboxToken) {
-      setBatchMessage("Mapbox must be loaded before batch estimates can run.");
+      setBatchMessage(
+        language === "en"
+          ? "Mapbox must be loaded before batch estimates can run."
+          : "Mapbox 载入完成后才能运行批量估算。",
+      );
       return;
     }
 
-    const addresses = eligibleAddresses.length > 0 ? eligibleAddresses : [];
+    const addresses = addressesToEstimate.length > 0 ? addressesToEstimate : [];
 
     if (addresses.length === 0) {
-      setBatchMessage("Load eligible addresses first.");
+      setBatchMessage(
+        language === "en" ? "Load eligible addresses first." : "请先载入符合条件的地址。",
+      );
       return;
     }
 
     setIsBatchRunning(true);
-    setBatchMessage(`Starting ${addresses.length} Mapbox/Turf estimates...`);
+    setBatchMessage(
+      language === "en"
+        ? `Starting ${addresses.length} Mapbox/Turf estimates...`
+        : `正在开始 ${addresses.length} 个 Mapbox/Turf 估算...`,
+    );
 
     for (const [index, address] of addresses.entries()) {
       setSelectedAddressId(address.id);
@@ -1302,7 +1603,11 @@ export default function RoofCalibrationTool() {
         await waitForMapIdle(map);
         await new Promise((resolve) => window.setTimeout(resolve, 120));
 
-        const estimate = findBuildingFootprints(map, [address.longitude, address.latitude]);
+        const estimate = findBuildingFootprints(
+          map,
+          [address.longitude, address.latitude],
+          address.parcel,
+        );
 
         setBatchResults((current) =>
           current.map((result) =>
@@ -1336,11 +1641,29 @@ export default function RoofCalibrationTool() {
         );
       }
 
-      setBatchMessage(`Estimated ${index + 1} of ${addresses.length} addresses.`);
+      setBatchMessage(
+        language === "en"
+          ? `Estimated ${index + 1} of ${addresses.length} addresses.`
+          : `已估算 ${index + 1} / ${addresses.length} 个地址。`,
+      );
     }
 
     setIsBatchRunning(false);
-    setBatchMessage(`Finished ${addresses.length} addresses.`);
+    setBatchMessage(
+      language === "en"
+        ? `Finished ${addresses.length} addresses.`
+        : `已完成 ${addresses.length} 个地址。`,
+    );
+  };
+
+  const loadAndRunEstimate = async () => {
+    const addresses = await loadEligibleAddresses();
+
+    if (addresses.length === 0) {
+      return;
+    }
+
+    await runBatchEstimate(addresses);
   };
 
   const updateAssumptions = <Key extends keyof CommunityAssumptions>(
@@ -1350,11 +1673,19 @@ export default function RoofCalibrationTool() {
     setAssumptions((current) => ({ ...current, [key]: value }));
   };
 
+  const toggleAddressColumn = (key: AddressTableColumnKey) => {
+    setHiddenAddressColumns((current) =>
+      current.includes(key) ? current.filter((column) => column !== key) : [...current, key],
+    );
+  };
+
   const startDrawingArea = () => {
     const draw = drawRef.current;
 
     if (!draw) {
-      setDrawMessage("Map drawing tools are still loading.");
+      setDrawMessage(
+        language === "en" ? "Map drawing tools are still loading." : "地图绘制工具仍在载入。",
+      );
       return;
     }
 
@@ -1366,7 +1697,7 @@ export default function RoofCalibrationTool() {
     setSelectedAddressId(null);
     setAddressMessage("");
     setBatchMessage("");
-    setDrawMessage("Click points on the map, then click the first point to close the area.");
+    setDrawMessage(copy.drawActive);
   };
 
   const clearDrawnArea = () => {
@@ -1379,7 +1710,7 @@ export default function RoofCalibrationTool() {
     setSelectedAddressId(null);
     setAddressMessage("");
     setBatchMessage("");
-    setDrawMessage("Draw a polygon around the houses to load. Max 50 eligible rows.");
+    setDrawMessage("");
   };
 
   const updateOverride = (id: string, patch: HouseOverride) => {
@@ -1514,19 +1845,28 @@ export default function RoofCalibrationTool() {
       <div className="mx-auto flex w-full max-w-[1720px] flex-col gap-3 px-3 py-3 lg:px-4">
         <header className="grid gap-3 border-b border-slate-300 pb-3 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
           <div>
-            <h1 className="text-2xl font-bold tracking-normal text-slate-950">
-              Roof Sqft Calibration Tool
-            </h1>
+            <h1 className="text-2xl font-bold tracking-normal text-slate-950">{copy.title}</h1>
             <p className="mt-1 max-w-4xl text-sm font-medium text-slate-600">
-              Draw a Calgary block or cluster of houses, load up to 50 eligible residential parcels,
-              then estimate each roof from Mapbox building footprints and Turf area calculations.
+              {copy.subtitle}
             </p>
           </div>
-          <div className="grid grid-cols-2 gap-2 text-right md:grid-cols-4">
-            <Metric label="Eligible rows" value={formatNumber(eligibleAddresses.length)} />
-            <Metric label="Estimated" value={formatNumber(estimatedCount)} />
-            <Metric label="No footprint" value={formatNumber(noFootprintCount)} />
-            <Metric label="Batch squares" value={formatNumber(totals.squares, 1)} />
+          <div className="grid gap-2">
+            <div className="flex justify-end">
+              <button
+                type="button"
+                onClick={() => setLanguage((current) => (current === "en" ? "zh" : "en"))}
+                className="secondary-button h-9 min-h-9 px-3 text-xs"
+                aria-label={copy.languageLabel}
+              >
+                {copy.languageButton}
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-right md:grid-cols-4">
+              <Metric label={copy.metrics.eligibleRows} value={formatNumber(eligibleAddresses.length)} />
+              <Metric label={copy.metrics.estimated} value={formatNumber(estimatedCount)} />
+              <Metric label={copy.metrics.noFootprint} value={formatNumber(noFootprintCount)} />
+              <Metric label={copy.metrics.batchSquares} value={formatNumber(totals.squares, 1)} />
+            </div>
           </div>
         </header>
 
@@ -1537,7 +1877,7 @@ export default function RoofCalibrationTool() {
         ) : null}
 
         <section className="grid min-w-0 gap-3 xl:grid-cols-[380px_minmax(0,1fr)_360px]">
-          <Panel title="1. Draw houses to load">
+          <Panel title={copy.drawPanel}>
             <div className="grid gap-3">
               <div className="grid grid-cols-2 gap-2">
                 <button
@@ -1546,19 +1886,19 @@ export default function RoofCalibrationTool() {
                   disabled={!mapReady}
                   className="primary-button"
                 >
-                  Draw area
+                  {copy.drawArea}
                 </button>
                 <button type="button" onClick={clearDrawnArea} className="secondary-button">
-                  Clear
+                  {copy.clear}
                 </button>
               </div>
               <p className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-700">
-                {drawMessage}
+                {drawMessage || copy.drawInstruction}
               </p>
               <div className="grid grid-cols-2 gap-2">
-                <Readout label="Max load" value="50 houses" strong />
+                <Readout label={copy.maxLoad} value={`${MAX_ELIGIBLE_ADDRESSES} ${copy.houses}`} strong />
                 <Readout
-                  label="Drawn area"
+                  label={copy.drawnArea}
                   value={
                     drawnAreaGeometry
                       ? `${formatNumber(
@@ -1566,19 +1906,19 @@ export default function RoofCalibrationTool() {
                             1_000_000,
                           3,
                         )} sq km`
-                      : "None"
+                      : copy.none
                   }
                 />
-                <Readout label="Loaded rows" value={formatNumber(eligibleAddresses.length)} />
-                <Readout label="Selected source" value="Calgary open data" />
+                <Readout label={copy.loadedRows} value={formatNumber(eligibleAddresses.length)} />
+                <Readout label={copy.selectedSource} value={copy.calgaryOpenData} />
               </div>
             </div>
           </Panel>
 
-          <Panel title="2. Community parameters">
+          <Panel title={copy.parametersPanel}>
             <div className="grid gap-3 md:grid-cols-4">
               <label className="field-label">
-                Default pitch
+                {copy.defaultPitch}
                 <select
                   value={assumptions.pitch}
                   onChange={(event) => updateAssumptions("pitch", event.target.value as PitchValue)}
@@ -1592,7 +1932,7 @@ export default function RoofCalibrationTool() {
                 </select>
               </label>
               <label className="field-label">
-                Overhang inches
+                {copy.overhang}
                 <input
                   value={assumptions.overhangInches}
                   onChange={(event) =>
@@ -1603,7 +1943,7 @@ export default function RoofCalibrationTool() {
                 />
               </label>
               <label className="field-label">
-                Calibration percent
+                {copy.calibration}
                 <input
                   value={assumptions.calibrationPercent}
                   onChange={(event) =>
@@ -1614,7 +1954,7 @@ export default function RoofCalibrationTool() {
                 />
               </label>
               <label className="field-label">
-                Waste factor
+                {copy.wasteFactor}
                 <input
                   value={assumptions.wasteFactor}
                   onChange={(event) => updateAssumptions("wasteFactor", Number(event.target.value))}
@@ -1623,7 +1963,7 @@ export default function RoofCalibrationTool() {
                 />
               </label>
               <label className="field-label">
-                Detached garage
+                {copy.detachedGarage}
                 <select
                   value={assumptions.detachedGaragePolicy}
                   onChange={(event) =>
@@ -1631,13 +1971,13 @@ export default function RoofCalibrationTool() {
                   }
                   className="control"
                 >
-                  <option value="exclude">Exclude</option>
-                  <option value="include">Include</option>
-                  <option value="auto">Auto</option>
+                  <option value="exclude">{copy.exclude}</option>
+                  <option value="include">{copy.include}</option>
+                  <option value="auto">{copy.auto}</option>
                 </select>
               </label>
               <label className="field-label">
-                Attached garage
+                {copy.attachedGarage}
                 <select
                   value={assumptions.attachedGaragePolicy}
                   onChange={(event) =>
@@ -1648,12 +1988,12 @@ export default function RoofCalibrationTool() {
                   }
                   className="control"
                 >
-                  <option value="include">Include</option>
-                  <option value="exclude">Exclude</option>
+                  <option value="include">{copy.include}</option>
+                  <option value="exclude">{copy.exclude}</option>
                 </select>
               </label>
               <label className="field-label">
-                Include duplexes
+                {copy.includeDuplexes}
                 <button
                   type="button"
                   onClick={() => updateAssumptions("includeDuplexes", !assumptions.includeDuplexes)}
@@ -1661,34 +2001,28 @@ export default function RoofCalibrationTool() {
                     assumptions.includeDuplexes ? "bg-emerald-50 text-emerald-800" : "bg-white"
                   }`}
                 >
-                  {assumptions.includeDuplexes ? "Yes, include R120" : "No, R110 only"}
+                  {assumptions.includeDuplexes ? copy.includeR120 : copy.r110Only}
                 </button>
               </label>
               <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-600">
-                Exclusion rule: townhouse, rowhouse, condo, apartment, commercial, industrial,
-                multi-unit, and non-residential rows are excluded because only RE + R110/R120 rows
-                are loaded.
+                {copy.exclusionRule}
               </div>
             </div>
           </Panel>
 
-          <Panel title="3. Load and run">
+          <Panel title={copy.loadPanel}>
             <div className="grid gap-2">
               <button
                 type="button"
-                onClick={() => void loadEligibleAddresses()}
-                disabled={!drawnAreaGeometry || isLoadingAddresses}
-                className="primary-button"
-              >
-                {isLoadingAddresses ? "Loading selected houses" : "Load selected houses"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void runBatchEstimate()}
-                disabled={isBatchRunning || eligibleAddresses.length === 0 || !mapReady}
+                onClick={() => void loadAndRunEstimate()}
+                disabled={!drawnAreaGeometry || isLoadingAddresses || isBatchRunning || !mapReady}
                 className="primary-button bg-slate-950 hover:bg-slate-700 disabled:bg-slate-400"
               >
-                {isBatchRunning ? "Running batch estimate" : "Run batch estimate"}
+                {isBatchRunning
+                  ? copy.runningBatch
+                  : isLoadingAddresses
+                    ? copy.loadingSelected
+                    : copy.loadAndRun}
               </button>
               <button
                 type="button"
@@ -1696,7 +2030,7 @@ export default function RoofCalibrationTool() {
                 disabled={batchResults.length === 0}
                 className="secondary-button"
               >
-                Export CSV
+                {copy.exportCsv}
               </button>
               <p className="text-xs font-semibold text-slate-600">{addressMessage}</p>
               <p className="text-xs font-semibold text-slate-600">{batchMessage}</p>
@@ -1704,52 +2038,101 @@ export default function RoofCalibrationTool() {
           </Panel>
         </section>
 
-        <section className="grid min-w-0 min-h-[680px] gap-3 xl:grid-cols-[minmax(0,1fr)_430px]">
-          <div className="grid min-w-0 gap-3">
-            <div className="min-w-0 overflow-hidden rounded-md border border-slate-300 bg-slate-200 shadow-sm">
-              {mapboxToken ? (
-                <div ref={mapContainerRef} className="h-[420px] w-full lg:h-[520px]" />
-              ) : (
-                <div className="flex h-[420px] items-center justify-center p-6 text-center text-sm font-semibold text-slate-600 lg:h-[520px]">
-                  Mapbox token required.
-                </div>
-              )}
-            </div>
+        <section className="grid min-w-0 gap-3 xl:grid-cols-[minmax(420px,0.95fr)_minmax(520px,1.05fr)]">
+          <Panel title={copy.mapView}>
+            <div className="grid min-w-0 gap-2">
+              <div className="min-w-0 overflow-hidden rounded-md border border-slate-300 bg-slate-200 shadow-sm">
+                {mapboxToken ? (
+                  <div ref={mapContainerRef} className="h-[430px] w-full xl:h-[620px]" />
+                ) : (
+                  <div className="flex h-[430px] items-center justify-center p-6 text-center text-sm font-semibold text-slate-600 xl:h-[620px]">
+                    {copy.mapboxRequired}
+                  </div>
+                )}
+              </div>
 
-            <div className="flex flex-wrap gap-2 rounded-md border border-slate-200 bg-white p-2 text-xs font-bold text-slate-700 shadow-sm">
-              <LegendSwatch color="#991b1b" label="Pre-1950" />
-              <LegendSwatch color="#dc2626" label="1950-1969" />
-              <LegendSwatch color="#f97316" label="1970-1989" />
-              <LegendSwatch color="#eab308" label="1990-2009" />
-              <LegendSwatch color="#22c55e" label="2010+" />
-              <span className="ml-auto text-slate-500">Blue outlines mark duplex rows.</span>
+              <div className="flex flex-wrap gap-2 rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-bold text-slate-700">
+                <LegendSwatch color="#991b1b" label="Pre-1950" />
+                <LegendSwatch color="#dc2626" label="1950-1969" />
+                <LegendSwatch color="#f97316" label="1970-1989" />
+                <LegendSwatch color="#eab308" label="1990-2009" />
+                <LegendSwatch color="#22c55e" label="2010+" />
+                <span className="ml-auto text-slate-500">{copy.duplexLegend}</span>
+              </div>
             </div>
+          </Panel>
 
-            <Panel title="Address table">
-              <div className="max-h-[480px] overflow-auto">
-                <table className="w-full min-w-[1320px] border-collapse text-left text-xs">
-                  <thead className="sticky top-0 z-10 bg-slate-50 uppercase tracking-normal text-slate-500">
-                    <tr className="border-y border-slate-200">
-                      <TableHeader>Address</TableHeader>
-                      <TableHeader>Dwelling type</TableHeader>
-                      <TableHeader>Year</TableHeader>
-                      <TableHeader>Age band</TableHeader>
-                      <TableHeader>Land use</TableHeader>
-                      <TableHeader>Roof sqft</TableHeader>
-                      <TableHeader>Squares</TableHeader>
-                      <TableHeader>Confidence</TableHeader>
-                      <TableHeader>Expected error</TableHeader>
-                      <TableHeader>Flags</TableHeader>
-                      <TableHeader>Status</TableHeader>
-                      <TableHeader>View</TableHeader>
+          <Panel title={copy.addressTable}>
+            <div className="grid min-w-0 gap-2">
+              <div className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 bg-slate-50 p-2">
+                <span className="text-xs font-bold uppercase tracking-normal text-slate-500">
+                  {copy.columns}
+                </span>
+                {ADDRESS_TABLE_COLUMNS.map((column) => (
+                  <button
+                    key={column.key}
+                    type="button"
+                    onClick={() => toggleAddressColumn(column.key)}
+                    className={`h-8 rounded-md border px-2 text-xs font-bold ${
+                      isAddressColumnVisible(column.key)
+                        ? "border-sky-200 bg-sky-50 text-sky-800"
+                        : "border-slate-200 bg-white text-slate-500"
+                    }`}
+                    aria-pressed={isAddressColumnVisible(column.key)}
+                  >
+                    {column.label[language]}
+                  </button>
+                ))}
+              </div>
+
+              <div className="max-h-[620px] overflow-auto rounded-md border border-slate-200">
+                <table className="address-table w-full min-w-[980px] border-collapse text-left text-xs">
+                  <thead className="sticky top-0 z-20 bg-slate-50 uppercase tracking-normal text-slate-500">
+                    <tr className="border-b border-slate-200">
+                      <TableHeader sticky>{copy.address}</TableHeader>
+                      {isAddressColumnVisible("dwellingType") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[0].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("year") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[1].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("ageBand") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[2].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("landUse") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[3].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("roofSqft") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[4].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("squares") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[5].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("confidence") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[6].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("expectedError") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[7].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("flags") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[8].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("status") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[9].label[language]}</TableHeader>
+                      ) : null}
+                      {isAddressColumnVisible("view") ? (
+                        <TableHeader>{ADDRESS_TABLE_COLUMNS[10].label[language]}</TableHeader>
+                      ) : null}
                     </tr>
                   </thead>
                   <tbody>
                     {batchResults.length === 0 ? (
                       <tr>
-                        <td colSpan={12} className="px-3 py-7 text-center text-sm text-slate-500">
-                          Draw an area on the map and load up to 50 eligible Calgary houses. No
-                          pasted address list is needed.
+                        <td
+                          colSpan={visibleAddressColumnCount}
+                          className="px-3 py-7 text-center text-sm text-slate-500"
+                        >
+                          {copy.emptyTable}
                         </td>
                       </tr>
                     ) : null}
@@ -1760,58 +2143,88 @@ export default function RoofCalibrationTool() {
                           selectedResult?.id === result.id ? "bg-cyan-50" : "hover:bg-slate-50"
                         }`}
                       >
-                        <TableCell>
-                          <span className="block max-w-[280px] truncate font-bold text-slate-950">
+                        <TableCell sticky>
+                          <span className="block max-w-[220px] truncate font-bold text-slate-950">
                             {result.address.address}
                           </span>
                         </TableCell>
-                        <TableCell>
-                          <span
-                            className={`rounded-md border px-2 py-1 text-[11px] font-bold ${
-                              result.address.dwellingType === "Duplex"
-                                ? "border-blue-200 bg-blue-50 text-blue-800"
-                                : "border-slate-200 bg-white text-slate-700"
-                            }`}
-                          >
-                            {result.address.dwellingType}
-                          </span>
-                        </TableCell>
-                        <TableCell>{result.address.constructionYear ?? "Unknown"}</TableCell>
-                        <TableCell>{result.address.ageBand}</TableCell>
-                        <TableCell>{result.address.landUse || "Unknown"}</TableCell>
-                        <TableCell>{result.roofSqft ? `${formatNumber(result.roofSqft)} sqft` : "-"}</TableCell>
-                        <TableCell>{result.roofingSquares ? formatNumber(result.roofingSquares, 1) : "-"}</TableCell>
-                        <TableCell>{result.confidence}</TableCell>
-                        <TableCell>
-                          {result.expectedErrorPercent
-                            ? `+/- ${formatNumber(result.expectedErrorPercent)}%`
-                            : "-"}
-                        </TableCell>
-                        <TableCell>
-                          <span className="block max-w-[280px] truncate">
-                            {result.flags.join("; ")}
-                          </span>
-                        </TableCell>
-                        <TableCell>{result.status}</TableCell>
-                        <TableCell>
-                          <button
-                            type="button"
-                            onClick={() => setSelectedAddressId(result.id)}
-                            className="secondary-button h-8 px-2 text-xs"
-                          >
-                            View
-                          </button>
-                        </TableCell>
+                        {isAddressColumnVisible("dwellingType") ? (
+                          <TableCell>
+                            <span
+                              className={`rounded-md border px-2 py-1 text-[11px] font-bold ${
+                                result.address.dwellingType === "Duplex"
+                                  ? "border-blue-200 bg-blue-50 text-blue-800"
+                                  : "border-slate-200 bg-white text-slate-700"
+                              }`}
+                            >
+                              {localizeDwellingType(result.address.dwellingType, language)}
+                            </span>
+                          </TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("year") ? (
+                          <TableCell>{result.address.constructionYear ?? copy.unknown}</TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("ageBand") ? (
+                          <TableCell>{result.address.ageBand}</TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("landUse") ? (
+                          <TableCell>{result.address.landUse || copy.unknown}</TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("roofSqft") ? (
+                          <TableCell>
+                            {result.roofSqft
+                              ? `${formatNumber(result.roofSqft)} ${copy.sqft}`
+                              : "-"}
+                          </TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("squares") ? (
+                          <TableCell>
+                            {result.roofingSquares ? formatNumber(result.roofingSquares, 1) : "-"}
+                          </TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("confidence") ? (
+                          <TableCell>{localizeConfidence(result.confidence, language)}</TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("expectedError") ? (
+                          <TableCell>
+                            {result.expectedErrorPercent
+                              ? `+/- ${formatNumber(result.expectedErrorPercent)}%`
+                              : "-"}
+                          </TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("flags") ? (
+                          <TableCell>
+                            <span className="block max-w-[260px] truncate">
+                              {result.flags.join("; ")}
+                            </span>
+                          </TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("status") ? (
+                          <TableCell>{localizeStatus(result.status, language)}</TableCell>
+                        ) : null}
+                        {isAddressColumnVisible("view") ? (
+                          <TableCell>
+                            <button
+                              type="button"
+                              onClick={() => setSelectedAddressId(result.id)}
+                              className="secondary-button h-8 px-2 text-xs"
+                            >
+                              {copy.viewButton}
+                            </button>
+                          </TableCell>
+                        ) : null}
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-            </Panel>
-          </div>
+            </div>
+          </Panel>
+        </section>
 
+        <section className="grid min-w-0 gap-3 xl:grid-cols-[minmax(0,1fr)]">
           <aside className="grid min-w-0 content-start gap-3">
-            <Panel title="Selected address">
+            <Panel title={copy.selectedAddress}>
               {selectedResult ? (
                 <div className="grid gap-3">
                   <div>
@@ -1819,42 +2232,54 @@ export default function RoofCalibrationTool() {
                       {selectedResult.address.address}
                     </h2>
                     <p className="text-xs font-semibold text-slate-600">
-                      {selectedResult.address.community} / {selectedResult.address.dwellingType} /{" "}
+                      {selectedResult.address.community} /{" "}
+                      {localizeDwellingType(selectedResult.address.dwellingType, language)} /{" "}
                       {selectedResult.address.classificationSource}
                     </p>
                   </div>
 
                   <div className="grid grid-cols-2 gap-2">
                     <Readout
-                      label="Roof sqft"
-                      value={`${formatNumber(selectedResult.roofSqft)} sqft`}
+                      label={copy.roofSqft}
+                      value={`${formatNumber(selectedResult.roofSqft)} ${copy.sqft}`}
                       strong
                     />
-                    <Readout label="Roofing squares" value={formatNumber(selectedResult.roofingSquares, 1)} />
                     <Readout
-                      label="Confidence"
-                      value={`${selectedResult.confidence} +/- ${formatNumber(
+                      label={copy.roofingSquares}
+                      value={formatNumber(selectedResult.roofingSquares, 1)}
+                    />
+                    <Readout
+                      label={copy.confidence}
+                      value={`${localizeConfidence(selectedResult.confidence, language)} +/- ${formatNumber(
                         selectedResult.expectedErrorPercent,
                       )}%`}
                     />
                     <Readout
-                      label="Structures"
-                      value={`${selectedResult.includedStructures} in / ${selectedResult.excludedStructures} out`}
+                      label={copy.structures}
+                      value={
+                        language === "en"
+                          ? `${selectedResult.includedStructures} ${copy.inOut.replace(
+                              "{out}",
+                              String(selectedResult.excludedStructures),
+                            )}`
+                          : `${copy.included} ${selectedResult.includedStructures} / ${copy.excluded} ${selectedResult.excludedStructures}`
+                      }
                     />
                   </div>
 
                   <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-700">
-                    <p>Source: City of Calgary Property Assessments API 4bsw-nn7w.</p>
+                    <p>{copy.source}: City of Calgary Property Assessments API 4bsw-nn7w.</p>
                     <p>
-                      Land use {selectedResult.address.landUse || "unknown"}, assessment{" "}
-                      {selectedResult.address.assessmentClassDescription || "unknown"}, unique key{" "}
-                      {selectedResult.address.uniqueKey || "not supplied"}.
+                      {copy.landUse} {selectedResult.address.landUse || copy.unknown},{" "}
+                      {copy.assessment}{" "}
+                      {selectedResult.address.assessmentClassDescription || copy.unknown},{" "}
+                      {copy.uniqueKey} {selectedResult.address.uniqueKey || copy.notSupplied}.
                     </p>
                   </div>
 
                   <div className="grid grid-cols-2 gap-2">
                     <label className="field-label">
-                      Pitch override
+                      {copy.pitchOverride}
                       <select
                         value={selectedOverride.pitch ?? selectedResult.pitch}
                         onChange={(event) =>
@@ -1872,7 +2297,7 @@ export default function RoofCalibrationTool() {
                       </select>
                     </label>
                     <label className="field-label">
-                      Overhang
+                      {copy.overhang}
                       <input
                         value={selectedOverride.overhangInches ?? selectedResult.overhangInches}
                         onChange={(event) =>
@@ -1885,7 +2310,7 @@ export default function RoofCalibrationTool() {
                       />
                     </label>
                     <label className="field-label">
-                      Calibration
+                      {copy.calibration}
                       <input
                         value={
                           selectedOverride.calibrationPercent ?? selectedResult.calibrationPercent
@@ -1900,7 +2325,7 @@ export default function RoofCalibrationTool() {
                       />
                     </label>
                     <label className="field-label">
-                      Confidence
+                      {copy.confidence}
                       <select
                         value={selectedOverride.confidence ?? selectedResult.confidence}
                         onChange={(event) =>
@@ -1912,13 +2337,13 @@ export default function RoofCalibrationTool() {
                       >
                         {["High", "Medium", "Low", "Unusable"].map((confidence) => (
                           <option key={confidence} value={confidence}>
-                            {confidence}
+                            {localizeConfidence(confidence as Confidence, language)}
                           </option>
                         ))}
                       </select>
                     </label>
                     <label className="field-label">
-                      Detached garage
+                      {copy.detachedGarage}
                       <select
                         value={
                           selectedOverride.detachedGaragePolicy ??
@@ -1931,13 +2356,13 @@ export default function RoofCalibrationTool() {
                         }
                         className="control"
                       >
-                        <option value="exclude">Exclude</option>
-                        <option value="include">Include</option>
-                        <option value="auto">Auto</option>
+                        <option value="exclude">{copy.exclude}</option>
+                        <option value="include">{copy.include}</option>
+                        <option value="auto">{copy.auto}</option>
                       </select>
                     </label>
                     <label className="field-label">
-                      Attached garage
+                      {copy.attachedGarage}
                       <select
                         value={
                           selectedOverride.attachedGaragePolicy ??
@@ -1950,14 +2375,14 @@ export default function RoofCalibrationTool() {
                         }
                         className="control"
                       >
-                        <option value="include">Include</option>
-                        <option value="exclude">Exclude</option>
+                        <option value="include">{copy.include}</option>
+                        <option value="exclude">{copy.exclude}</option>
                       </select>
                     </label>
                   </div>
 
                   <label className="field-label">
-                    Notes
+                    {copy.notes}
                     <textarea
                       value={selectedOverride.notes ?? ""}
                       onChange={(event) =>
@@ -1965,17 +2390,17 @@ export default function RoofCalibrationTool() {
                       }
                       rows={3}
                       className="control min-h-20 resize-y py-2"
-                      placeholder="Saved automatically to this browser"
+                      placeholder={copy.notesPlaceholder}
                     />
                   </label>
 
                   <div className="grid gap-2">
                     <h3 className="text-xs font-bold uppercase tracking-normal text-slate-500">
-                      Included/excluded roof structures
+                      {copy.roofStructures}
                     </h3>
                     {selectedResult.facets.length === 0 ? (
                       <div className="rounded-md border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
-                        No Mapbox building footprint has been attached to this row yet.
+                        {copy.noFootprintAttached}
                       </div>
                     ) : null}
                     {selectedResult.facets.map((facet, index) => (
@@ -1986,7 +2411,7 @@ export default function RoofCalibrationTool() {
                         <div className="flex items-start justify-between gap-2">
                           <div>
                             <p className="text-xs font-bold text-slate-950">
-                              Structure {index + 1}: {facet.role}
+                              {copy.structure} {index + 1}: {facet.role}
                             </p>
                             <p className="text-[11px] font-semibold text-slate-500">
                               {facet.includeReason}
@@ -2005,7 +2430,7 @@ export default function RoofCalibrationTool() {
                                 : "border-slate-200 bg-slate-50 text-slate-500"
                             }`}
                           >
-                            {facet.included ? "Included" : "Excluded"}
+                            {facet.included ? copy.included : copy.excluded}
                           </button>
                         </div>
                         <select
@@ -2029,13 +2454,13 @@ export default function RoofCalibrationTool() {
 
                   <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
                     <p className="text-xs font-bold uppercase tracking-normal text-slate-500">
-                      Flags
+                      {copy.flags}
                     </p>
                     <p className="text-xs font-semibold text-slate-700">
                       {selectedResult.flags.join("; ")}
                     </p>
                     <p className="mt-2 text-xs font-bold uppercase tracking-normal text-slate-500">
-                      Assumptions
+                      {copy.assumptions}
                     </p>
                     <p className="text-xs font-semibold text-slate-700">
                       {selectedResult.assumptions.join("; ")}
@@ -2044,8 +2469,7 @@ export default function RoofCalibrationTool() {
                 </div>
               ) : (
                 <p className="text-sm font-medium text-slate-600">
-                  Draw an area and select an address row to inspect source data, assumptions,
-                  structures, and overrides.
+                  {copy.selectedEmpty}
                 </p>
               )}
             </Panel>
@@ -2103,12 +2527,28 @@ function Readout({
   );
 }
 
-function TableHeader({ children }: { children: React.ReactNode }) {
-  return <th className="px-3 py-2 font-bold">{children}</th>;
+function TableHeader({ children, sticky = false }: { children: React.ReactNode; sticky?: boolean }) {
+  return (
+    <th
+      className={`whitespace-nowrap px-3 py-2 font-bold ${
+        sticky ? "sticky left-0 z-30 min-w-[190px] bg-slate-50 shadow-[1px_0_0_#e2e8f0]" : ""
+      }`}
+    >
+      {children}
+    </th>
+  );
 }
 
-function TableCell({ children }: { children: React.ReactNode }) {
-  return <td className="px-3 py-2 align-middle text-slate-700">{children}</td>;
+function TableCell({ children, sticky = false }: { children: React.ReactNode; sticky?: boolean }) {
+  return (
+    <td
+      className={`whitespace-nowrap px-3 py-2 align-middle text-slate-700 ${
+        sticky ? "sticky left-0 z-10 min-w-[190px] bg-inherit shadow-[1px_0_0_#e2e8f0]" : ""
+      }`}
+    >
+      {children}
+    </td>
+  );
 }
 
 function LegendSwatch({ color, label }: { color: string; label: string }) {
