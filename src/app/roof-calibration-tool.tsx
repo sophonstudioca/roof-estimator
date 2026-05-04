@@ -9,6 +9,7 @@ import {
   distance as turfDistance,
   point as turfPoint,
 } from "@turf/turf";
+import MapboxDraw from "@mapbox/mapbox-gl-draw";
 import type { Feature, FeatureCollection, Geometry, MultiPolygon, Polygon } from "geojson";
 import mapboxgl from "mapbox-gl";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -39,30 +40,10 @@ type CalgaryAssessmentRow = {
   sub_property_use?: string;
   assessment_class?: string;
   assessment_class_description?: string;
-  multipolygon?: MultiPolygon;
+  multipolygon?: unknown;
   unique_key?: string;
   cpid?: string;
   roll_number?: string;
-};
-
-type GroupedSummaryRow = {
-  comm_name?: string;
-  sub_property_use?: string;
-  year_of_construction?: string;
-  count?: string;
-};
-
-type AgeTypeBreakdown = Record<AgeBand, Record<DwellingType, number>>;
-
-type CommunitySummary = {
-  community: string;
-  singleDetachedCount: number;
-  duplexCount: number;
-  total: number;
-  averageYear: number | null;
-  oldestYear: number | null;
-  priorityScore: number;
-  ageTypeBreakdown: AgeTypeBreakdown;
 };
 
 type CommunityAssumptions = {
@@ -201,15 +182,6 @@ const PITCH_OPTIONS: Array<{ label: PitchValue; multiplier: number }> = [
   { label: "12/12", multiplier: 1.414 },
 ];
 
-const AGE_BANDS: AgeBand[] = [
-  "Pre-1950",
-  "1950-1969",
-  "1970-1989",
-  "1990-2009",
-  "2010+",
-  "Unknown",
-];
-
 function pitchMultiplierFor(pitch: PitchValue) {
   return PITCH_OPTIONS.find((option) => option.label === pitch)?.multiplier ?? 1.118;
 }
@@ -254,16 +226,6 @@ function ageBandFor(year: number | null): AgeBand {
   return "2010+";
 }
 
-function createEmptyBreakdown(): AgeTypeBreakdown {
-  return AGE_BANDS.reduce((bands, band) => {
-    bands[band] = {
-      "Single detached": 0,
-      Duplex: 0,
-    };
-    return bands;
-  }, {} as AgeTypeBreakdown);
-}
-
 function dwellingTypeForCode(code: string | undefined): DwellingType | null {
   if (code === "R110") {
     return "Single detached";
@@ -299,6 +261,68 @@ function parseYear(value: string | undefined) {
 
 function escapeSoqlLiteral(value: string) {
   return value.replaceAll("'", "''");
+}
+
+function normalizePosition(raw: unknown): [number, number] | null {
+  if (Array.isArray(raw) && raw.length >= 2) {
+    const lng = Number(raw[0]);
+    const lat = Number(raw[1]);
+
+    return Number.isFinite(lng) && Number.isFinite(lat) ? [lng, lat] : null;
+  }
+
+  if (typeof raw === "string") {
+    const [lngRaw, latRaw] = raw.trim().split(/\s+/);
+    const lng = Number(lngRaw);
+    const lat = Number(latRaw);
+
+    return Number.isFinite(lng) && Number.isFinite(lat) ? [lng, lat] : null;
+  }
+
+  return null;
+}
+
+function normalizeMultiPolygon(raw: unknown): MultiPolygon | null {
+  if (!raw || typeof raw !== "object" || !("type" in raw) || !("coordinates" in raw)) {
+    return null;
+  }
+
+  const candidate = raw as { type?: unknown; coordinates?: unknown };
+
+  if (candidate.type !== "MultiPolygon" || !Array.isArray(candidate.coordinates)) {
+    return null;
+  }
+
+  const coordinates = candidate.coordinates
+    .map((polygon) =>
+      Array.isArray(polygon)
+        ? polygon
+            .map((ring) =>
+              Array.isArray(ring)
+                ? ring
+                    .map((position) => normalizePosition(position))
+                    .filter((position): position is [number, number] => position !== null)
+                : [],
+            )
+            .filter((ring) => ring.length >= 4)
+        : [],
+    )
+    .filter((polygon) => polygon.length > 0);
+
+  return coordinates.length > 0 ? { type: "MultiPolygon", coordinates } : null;
+}
+
+function polygonToWkt(geometry: Polygon) {
+  const rings = geometry.coordinates
+    .filter((ring) => ring.length >= 4)
+    .map(
+      (ring) =>
+        `(${ring
+          .map((position) => `${Number(position[0]).toFixed(7)} ${Number(position[1]).toFixed(7)}`)
+          .join(",")})`,
+    );
+
+  return `POLYGON(${rings.join(",")})`;
 }
 
 function buildSocrataUrl(params: Record<string, string | number>) {
@@ -732,7 +756,7 @@ function addressFromRow(
   }
 
   if (dwellingType === "Duplex") {
-    const duplexKey = row.cpid || JSON.stringify(row.multipolygon?.coordinates ?? row.address);
+    const duplexKey = row.cpid || JSON.stringify(row.multipolygon ?? row.address);
 
     if (seenDuplexKeys.has(duplexKey)) {
       return null;
@@ -742,8 +766,9 @@ function addressFromRow(
   }
 
   const constructionYear = parseYear(row.year_of_construction);
+  const multipolygon = normalizeMultiPolygon(row.multipolygon);
   const parcel =
-    row.multipolygon?.type === "MultiPolygon"
+    multipolygon
       ? ({
           type: "Feature",
           id: row.unique_key ?? row.address,
@@ -756,7 +781,7 @@ function addressFromRow(
             constructionYear,
             subPropertyUse: row.sub_property_use ?? "",
           },
-          geometry: row.multipolygon,
+          geometry: multipolygon,
         } satisfies ParcelFeature)
       : null;
   const parcelCenter = parcel ? turfCenter(parcel) : null;
@@ -818,23 +843,21 @@ export default function RoofCalibrationTool() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markerRef = useRef<mapboxgl.Marker | null>(null);
+  const drawRef = useRef<MapboxDraw | null>(null);
   const [mapReady, setMapReady] = useState(false);
-  const [communitySummaries, setCommunitySummaries] = useState<CommunitySummary[]>([]);
-  const [selectedCommunity, setSelectedCommunity] = useState("");
+  const [selectedCommunity] = useState("drawn-area");
+  const [drawnAreaGeometry, setDrawnAreaGeometry] = useState<Polygon | null>(null);
   const [assumptions, setAssumptions] = useState<CommunityAssumptions>(DEFAULT_ASSUMPTIONS);
   const [eligibleAddresses, setEligibleAddresses] = useState<EligibleAddress[]>([]);
   const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
   const [selectedAddressId, setSelectedAddressId] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<Record<string, HouseOverride>>({});
-  const [communityMessage, setCommunityMessage] = useState("Loading Calgary community summaries...");
+  const [drawMessage, setDrawMessage] = useState("Draw a polygon around the houses to load. Max 50 eligible rows.");
   const [addressMessage, setAddressMessage] = useState("");
   const [batchMessage, setBatchMessage] = useState("");
-  const [isLoadingCommunities, setIsLoadingCommunities] = useState(true);
   const [isLoadingAddresses, setIsLoadingAddresses] = useState(false);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
 
-  const selectedSummary =
-    communitySummaries.find((summary) => summary.community === selectedCommunity) ?? null;
   const selectedResult =
     batchResults.find((result) => result.id === selectedAddressId) ??
     (selectedAddressId
@@ -856,115 +879,33 @@ export default function RoofCalibrationTool() {
     };
   }, [batchResults]);
 
-  const fetchCommunitySummaries = useCallback(async () => {
-    setIsLoadingCommunities(true);
-    setCommunityMessage("Loading Calgary community summaries...");
+  const syncDrawnArea = useCallback(() => {
+    const draw = drawRef.current;
 
-    try {
-      const url = buildSocrataUrl({
-        $select: "comm_name,sub_property_use,year_of_construction,count(*) as count",
-        $where:
-          "assessment_class='RE' AND sub_property_use in('R110','R120') AND year_of_construction IS NOT NULL",
-        $group: "comm_name,sub_property_use,year_of_construction",
-        $limit: 50000,
-      });
-      const response = await fetch(url);
-
-      if (!response.ok) {
-        throw new Error(`Calgary data request failed with ${response.status}.`);
-      }
-
-      const rows = (await response.json()) as GroupedSummaryRow[];
-      const summaries = new Map<string, CommunitySummary & { weightedYearTotal: number }>();
-
-      rows.forEach((row) => {
-        const community = row.comm_name?.trim();
-        const dwellingType = dwellingTypeForCode(row.sub_property_use);
-        const year = parseYear(row.year_of_construction);
-        const count = Number(row.count ?? 0);
-
-        if (!community || !dwellingType || !Number.isFinite(count) || count <= 0) {
-          return;
-        }
-
-        const current =
-          summaries.get(community) ??
-          ({
-            community,
-            singleDetachedCount: 0,
-            duplexCount: 0,
-            total: 0,
-            averageYear: null,
-            oldestYear: null,
-            priorityScore: 0,
-            ageTypeBreakdown: createEmptyBreakdown(),
-            weightedYearTotal: 0,
-          } satisfies CommunitySummary & { weightedYearTotal: number });
-        const band = ageBandFor(year);
-
-        current.total += count;
-        current.weightedYearTotal += (year ?? 0) * count;
-        current.oldestYear =
-          year === null
-            ? current.oldestYear
-            : current.oldestYear === null
-              ? year
-              : Math.min(current.oldestYear, year);
-
-        if (dwellingType === "Single detached") {
-          current.singleDetachedCount += count;
-        } else {
-          current.duplexCount += count;
-        }
-
-        current.ageTypeBreakdown[band][dwellingType] += count;
-        summaries.set(community, current);
-      });
-
-      const processed = Array.from(summaries.values())
-        .map((summary) => {
-          const olderCount =
-            summary.ageTypeBreakdown["Pre-1950"]["Single detached"] +
-            summary.ageTypeBreakdown["Pre-1950"].Duplex +
-            summary.ageTypeBreakdown["1950-1969"]["Single detached"] +
-            summary.ageTypeBreakdown["1950-1969"].Duplex +
-            summary.ageTypeBreakdown["1970-1989"]["Single detached"] +
-            summary.ageTypeBreakdown["1970-1989"].Duplex;
-          const averageYear = summary.total ? summary.weightedYearTotal / summary.total : null;
-
-          return {
-            community: summary.community,
-            singleDetachedCount: summary.singleDetachedCount,
-            duplexCount: summary.duplexCount,
-            total: summary.total,
-            averageYear,
-            oldestYear: summary.oldestYear,
-            priorityScore: olderCount * 2 + summary.total * 0.2 - (averageYear ?? 2026),
-            ageTypeBreakdown: summary.ageTypeBreakdown,
-          } satisfies CommunitySummary;
-        })
-        .filter((summary) => summary.total >= 50)
-        .sort((a, b) => b.priorityScore - a.priorityScore);
-
-      setCommunitySummaries(processed);
-      setSelectedCommunity((current) => current || processed[0]?.community || "");
-      setCommunityMessage(
-        `Loaded ${processed.length} Calgary communities. Sorted by older construction stock and eligible detached/duplex count.`,
-      );
-    } catch (error) {
-      setCommunityMessage(
-        error instanceof Error
-          ? error.message
-          : "Unable to load Calgary community summaries from open data.",
-      );
-    } finally {
-      setIsLoadingCommunities(false);
+    if (!draw) {
+      return;
     }
-  }, []);
 
-  useEffect(() => {
-    void fetchCommunitySummaries();
-  }, [fetchCommunitySummaries]);
+    const polygon = draw
+      .getAll()
+      .features.find((feature): feature is Feature<Polygon> => feature.geometry.type === "Polygon");
+
+    if (!polygon) {
+      setDrawnAreaGeometry(null);
+      setDrawMessage("Draw a polygon around the houses to load. Max 50 eligible rows.");
+      return;
+    }
+
+    setDrawnAreaGeometry(polygon.geometry);
+    setDrawMessage(
+      `Area drawn. Approx ${formatNumber(turfArea(polygon) / 1_000_000, 3)} sq km. Ready to load up to 50 eligible houses.`,
+    );
+    setEligibleAddresses([]);
+    setBatchResults([]);
+    setSelectedAddressId(null);
+    setAddressMessage("");
+    setBatchMessage("");
+  }, []);
 
   useEffect(() => {
     try {
@@ -997,9 +938,20 @@ export default function RoofCalibrationTool() {
       attributionControl: false,
     });
 
+    const draw = new MapboxDraw({
+      defaultMode: "simple_select",
+      displayControlsDefault: false,
+      controls: {
+        polygon: true,
+        trash: true,
+      },
+    });
+
     map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), "top-right");
     map.addControl(new mapboxgl.AttributionControl({ compact: true }), "bottom-right");
+    map.addControl(draw, "top-left");
     mapRef.current = map;
+    drawRef.current = draw;
 
     map.on("load", () => {
       map.addSource(BUILDING_SOURCE_ID, {
@@ -1136,14 +1088,19 @@ export default function RoofCalibrationTool() {
       setMapReady(true);
     });
 
+    map.on("draw.create", syncDrawnArea);
+    map.on("draw.update", syncDrawnArea);
+    map.on("draw.delete", syncDrawnArea);
+
     return () => {
       markerRef.current?.remove();
       markerRef.current = null;
+      drawRef.current = null;
       mapRef.current = null;
       setMapReady(false);
       map.remove();
     };
-  }, [mapboxToken]);
+  }, [mapboxToken, syncDrawnArea]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1218,29 +1175,31 @@ export default function RoofCalibrationTool() {
   }, [assumptions, overrides]);
 
   const loadEligibleAddresses = async () => {
-    if (!selectedCommunity) {
+    if (!drawnAreaGeometry) {
+      setAddressMessage("Draw an area on the map first.");
       return;
     }
 
     setIsLoadingAddresses(true);
-    setAddressMessage("Loading eligible Calgary assessment rows...");
+    setAddressMessage("Loading up to 50 eligible Calgary assessment rows inside the drawn area...");
     setBatchMessage("");
     setSelectedAddressId(null);
 
     try {
+      const drawnWkt = polygonToWkt(drawnAreaGeometry);
       const where = [
-        `comm_name='${escapeSoqlLiteral(selectedCommunity)}'`,
         "assessment_class='RE'",
         assumptions.includeDuplexes
           ? "sub_property_use in('R110','R120')"
           : "sub_property_use='R110'",
+        `intersects(multipolygon, '${escapeSoqlLiteral(drawnWkt)}')`,
       ].join(" AND ");
       const url = buildSocrataUrl({
         $select:
           "address,comm_name,year_of_construction,land_use_designation,property_type,sub_property_use,assessment_class,assessment_class_description,multipolygon,unique_key,cpid,roll_number",
         $where: where,
-        $order: "address",
-        $limit: 5000,
+        $order: "comm_name,address",
+        $limit: 50,
       });
       const response = await fetch(url);
 
@@ -1269,7 +1228,7 @@ export default function RoofCalibrationTool() {
       );
       setSelectedAddressId(addresses[0]?.id ?? null);
       setAddressMessage(
-        `Loaded ${addresses.length} eligible addresses from Calgary open data. Filtered to residential R110 single detached${assumptions.includeDuplexes ? " and R120 duplex" : ""} rows only.`,
+        `Loaded ${addresses.length} eligible addresses inside the drawn area. Max 50. Filtered to residential R110 single detached${assumptions.includeDuplexes ? " and R120 duplex" : ""} rows only.`,
       );
     } catch (error) {
       setAddressMessage(
@@ -1389,6 +1348,38 @@ export default function RoofCalibrationTool() {
     value: CommunityAssumptions[Key],
   ) => {
     setAssumptions((current) => ({ ...current, [key]: value }));
+  };
+
+  const startDrawingArea = () => {
+    const draw = drawRef.current;
+
+    if (!draw) {
+      setDrawMessage("Map drawing tools are still loading.");
+      return;
+    }
+
+    draw.deleteAll();
+    draw.changeMode("draw_polygon");
+    setDrawnAreaGeometry(null);
+    setEligibleAddresses([]);
+    setBatchResults([]);
+    setSelectedAddressId(null);
+    setAddressMessage("");
+    setBatchMessage("");
+    setDrawMessage("Click points on the map, then click the first point to close the area.");
+  };
+
+  const clearDrawnArea = () => {
+    drawRef.current?.deleteAll();
+    markerRef.current?.remove();
+    markerRef.current = null;
+    setDrawnAreaGeometry(null);
+    setEligibleAddresses([]);
+    setBatchResults([]);
+    setSelectedAddressId(null);
+    setAddressMessage("");
+    setBatchMessage("");
+    setDrawMessage("Draw a polygon around the houses to load. Max 50 eligible rows.");
   };
 
   const updateOverride = (id: string, patch: HouseOverride) => {
@@ -1527,8 +1518,8 @@ export default function RoofCalibrationTool() {
               Roof Sqft Calibration Tool
             </h1>
             <p className="mt-1 max-w-4xl text-sm font-medium text-slate-600">
-              Calgary community batch estimator using City of Calgary assessment parcels, inferred
-              R110/R120 dwelling type, Mapbox building footprints, and Turf area calculations.
+              Draw a Calgary block or cluster of houses, load up to 50 eligible residential parcels,
+              then estimate each roof from Mapbox building footprints and Turf area calculations.
             </p>
           </div>
           <div className="grid grid-cols-2 gap-2 text-right md:grid-cols-4">
@@ -1546,60 +1537,41 @@ export default function RoofCalibrationTool() {
         ) : null}
 
         <section className="grid min-w-0 gap-3 xl:grid-cols-[380px_minmax(0,1fr)_360px]">
-          <Panel title="1. Select community">
+          <Panel title="1. Draw houses to load">
             <div className="grid gap-3">
-              <label className="field-label">
-                Community
-                <select
-                  value={selectedCommunity}
-                  onChange={(event) => {
-                    setSelectedCommunity(event.target.value);
-                    setEligibleAddresses([]);
-                    setBatchResults([]);
-                    setSelectedAddressId(null);
-                    setAddressMessage("");
-                  }}
-                  disabled={isLoadingCommunities}
-                  className="control"
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={startDrawingArea}
+                  disabled={!mapReady}
+                  className="primary-button"
                 >
-                  {communitySummaries.map((summary) => (
-                    <option key={summary.community} value={summary.community}>
-                      {summary.community} ({formatNumber(summary.total)})
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <p className="text-xs font-semibold text-slate-600">{communityMessage}</p>
-
-              {selectedSummary ? (
-                <>
-                  <div className="grid grid-cols-2 gap-2">
-                    <Readout label="Eligible homes" value={formatNumber(selectedSummary.total)} strong />
-                    <Readout
-                      label="Avg build year"
-                      value={
-                        selectedSummary.averageYear
-                          ? formatNumber(selectedSummary.averageYear)
-                          : "Unknown"
-                      }
-                    />
-                    <Readout
-                      label="Single detached"
-                      value={formatNumber(selectedSummary.singleDetachedCount)}
-                    />
-                    <Readout label="Duplexes" value={formatNumber(selectedSummary.duplexCount)} />
-                    <Readout
-                      label="Oldest row"
-                      value={selectedSummary.oldestYear ? String(selectedSummary.oldestYear) : "Unknown"}
-                    />
-                    <Readout
-                      label="Priority score"
-                      value={formatNumber(selectedSummary.priorityScore)}
-                    />
-                  </div>
-                  <AgeBreakdownTable summary={selectedSummary} />
-                </>
-              ) : null}
+                  Draw area
+                </button>
+                <button type="button" onClick={clearDrawnArea} className="secondary-button">
+                  Clear
+                </button>
+              </div>
+              <p className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-700">
+                {drawMessage}
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <Readout label="Max load" value="50 houses" strong />
+                <Readout
+                  label="Drawn area"
+                  value={
+                    drawnAreaGeometry
+                      ? `${formatNumber(
+                          turfArea({ type: "Feature", properties: {}, geometry: drawnAreaGeometry }) /
+                            1_000_000,
+                          3,
+                        )} sq km`
+                      : "None"
+                  }
+                />
+                <Readout label="Loaded rows" value={formatNumber(eligibleAddresses.length)} />
+                <Readout label="Selected source" value="Calgary open data" />
+              </div>
             </div>
           </Panel>
 
@@ -1705,10 +1677,10 @@ export default function RoofCalibrationTool() {
               <button
                 type="button"
                 onClick={() => void loadEligibleAddresses()}
-                disabled={!selectedCommunity || isLoadingAddresses}
+                disabled={!drawnAreaGeometry || isLoadingAddresses}
                 className="primary-button"
               >
-                {isLoadingAddresses ? "Loading addresses" : "Load eligible addresses"}
+                {isLoadingAddresses ? "Loading selected houses" : "Load selected houses"}
               </button>
               <button
                 type="button"
@@ -1776,8 +1748,8 @@ export default function RoofCalibrationTool() {
                     {batchResults.length === 0 ? (
                       <tr>
                         <td colSpan={12} className="px-3 py-7 text-center text-sm text-slate-500">
-                          Select a community and load eligible Calgary addresses. No pasted address
-                          list is needed.
+                          Draw an area on the map and load up to 50 eligible Calgary houses. No
+                          pasted address list is needed.
                         </td>
                       </tr>
                     ) : null}
@@ -2072,7 +2044,7 @@ export default function RoofCalibrationTool() {
                 </div>
               ) : (
                 <p className="text-sm font-medium text-slate-600">
-                  Load a community and select an address row to inspect source data, assumptions,
+                  Draw an area and select an address row to inspect source data, assumptions,
                   structures, and overrides.
                 </p>
               )}
@@ -2145,30 +2117,5 @@ function LegendSwatch({ color, label }: { color: string; label: string }) {
       <span className="h-3 w-3 rounded-sm border border-slate-300" style={{ background: color }} />
       {label}
     </span>
-  );
-}
-
-function AgeBreakdownTable({ summary }: { summary: CommunitySummary }) {
-  return (
-    <div className="overflow-hidden rounded-md border border-slate-200">
-      <table className="w-full border-collapse text-left text-xs">
-        <thead className="bg-slate-50 uppercase tracking-normal text-slate-500">
-          <tr>
-            <TableHeader>Age band</TableHeader>
-            <TableHeader>Detached</TableHeader>
-            <TableHeader>Duplex</TableHeader>
-          </tr>
-        </thead>
-        <tbody>
-          {AGE_BANDS.map((band) => (
-            <tr key={band} className="border-t border-slate-100">
-              <TableCell>{band}</TableCell>
-              <TableCell>{formatNumber(summary.ageTypeBreakdown[band]["Single detached"])}</TableCell>
-              <TableCell>{formatNumber(summary.ageTypeBreakdown[band].Duplex)}</TableCell>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   );
 }
