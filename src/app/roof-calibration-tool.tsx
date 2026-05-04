@@ -1545,7 +1545,7 @@ export default function RoofCalibrationTool() {
           </div>
         ) : null}
 
-        <section className="grid gap-3 xl:grid-cols-[380px_minmax(0,1fr)_360px]">
+        <section className="grid min-w-0 gap-3 xl:grid-cols-[380px_minmax(0,1fr)_360px]">
           <Panel title="1. Select community">
             <div className="grid gap-3">
               <label className="field-label">
@@ -1732,9 +1732,9 @@ export default function RoofCalibrationTool() {
           </Panel>
         </section>
 
-        <section className="grid min-h-[680px] gap-3 xl:grid-cols-[minmax(0,1fr)_430px]">
-          <div className="grid gap-3">
-            <div className="overflow-hidden rounded-md border border-slate-300 bg-slate-200 shadow-sm">
+        <section className="grid min-w-0 min-h-[680px] gap-3 xl:grid-cols-[minmax(0,1fr)_430px]">
+          <div className="grid min-w-0 gap-3">
+            <div className="min-w-0 overflow-hidden rounded-md border border-slate-300 bg-slate-200 shadow-sm">
               {mapboxToken ? (
                 <div ref={mapContainerRef} className="h-[420px] w-full lg:h-[520px]" />
               ) : (
@@ -1838,7 +1838,7 @@ export default function RoofCalibrationTool() {
             </Panel>
           </div>
 
-          <aside className="grid content-start gap-3">
+          <aside className="grid min-w-0 content-start gap-3">
             <Panel title="Selected address">
               {selectedResult ? (
                 <div className="grid gap-3">
@@ -2086,7 +2086,7 @@ export default function RoofCalibrationTool() {
 
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="rounded-md border border-slate-200 bg-white p-3 shadow-sm">
+    <section className="min-w-0 rounded-md border border-slate-200 bg-white p-3 shadow-sm">
       <h2 className="mb-2 text-xs font-bold uppercase tracking-normal text-slate-600">
         {title}
       </h2>
