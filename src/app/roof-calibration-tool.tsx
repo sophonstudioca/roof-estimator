@@ -18,6 +18,7 @@ type RoofFeature = Feature<Polygon | MultiPolygon>;
 type PitchValue = "3/12" | "4/12" | "6/12" | "8/12" | "10/12" | "12/12";
 type Confidence = "High" | "Medium" | "Low" | "Unusable";
 type Status = "Pass" | "Review" | "Fail";
+type GaragePolicy = "auto" | "include" | "exclude";
 type StructureRole =
   | "Main roof"
   | "Attached roof candidate"
@@ -95,6 +96,48 @@ type AutoRoofProfile = {
   reasons: string[];
 };
 
+type CommunityProfile = {
+  community: string;
+  buildEra: string;
+  dominantHouseType: string;
+  defaultPitch: PitchValue;
+  defaultOverhangInches: number;
+  detachedGaragePolicy: GaragePolicy;
+  attachedGaragePolicy: "include" | "exclude";
+  calibrationAdjustmentPercent: number;
+  expectedErrorPercent: number;
+  confidence: Confidence;
+  notes: string;
+};
+
+type BatchResult = {
+  id: string;
+  address: string;
+  resolvedAddress: string;
+  community: string;
+  latitude: number | null;
+  longitude: number | null;
+  buildingFootprintSqft: number;
+  overhangFootprintSqft: number;
+  roofSqft: number;
+  roofingSquares: number;
+  wasteAdjustedSqft: number;
+  pitch: PitchValue;
+  pitchMultiplier: number;
+  overhangInches: number;
+  calibrationAdjustmentPercent: number;
+  buildEra: string;
+  houseType: string;
+  garagePolicy: string;
+  includedStructures: number;
+  excludedStructures: number;
+  confidence: Confidence;
+  expectedErrorPercent: number;
+  flags: string[];
+  assumptions: string[];
+  status: "Estimated" | "No footprint" | "Error";
+};
+
 const SQM_TO_SQFT = 10.7639;
 const DEFAULT_PITCH: PitchValue = "6/12";
 const STORAGE_KEY = "roof-sqft-calibration-measurements-v1";
@@ -116,6 +159,74 @@ const CONFIDENCE_HELP: Record<Confidence, string> = {
   Low: "Trees, shadows, complex roof, or uncertain pitch",
   Unusable: "Roof cannot be measured reliably",
 };
+
+const COMMUNITY_PROFILES: CommunityProfile[] = [
+  {
+    community: "Sandstone Valley",
+    buildEra: "1980s-1990s",
+    dominantHouseType: "two-storey detached",
+    defaultPitch: "8/12",
+    defaultOverhangInches: 12,
+    detachedGaragePolicy: "exclude",
+    attachedGaragePolicy: "include",
+    calibrationAdjustmentPercent: 8,
+    expectedErrorPercent: 14,
+    confidence: "Medium",
+    notes: "Suburban north Calgary profile with many attached garages and moderately steep rooflines.",
+  },
+  {
+    community: "Acadia",
+    buildEra: "1950s-1960s",
+    dominantHouseType: "bungalow",
+    defaultPitch: "4/12",
+    defaultOverhangInches: 14,
+    detachedGaragePolicy: "exclude",
+    attachedGaragePolicy: "include",
+    calibrationAdjustmentPercent: 4,
+    expectedErrorPercent: 16,
+    confidence: "Medium",
+    notes: "Older bungalow profile. Detached rear garages are common and excluded by default.",
+  },
+  {
+    community: "Bowness",
+    buildEra: "mixed older and infill",
+    dominantHouseType: "bungalow and infill mix",
+    defaultPitch: "6/12",
+    defaultOverhangInches: 14,
+    detachedGaragePolicy: "exclude",
+    attachedGaragePolicy: "include",
+    calibrationAdjustmentPercent: 6,
+    expectedErrorPercent: 20,
+    confidence: "Low",
+    notes: "Mixed housing stock and mature trees increase variance.",
+  },
+  {
+    community: "Mahogany",
+    buildEra: "2010s-2020s",
+    dominantHouseType: "newer two-storey detached",
+    defaultPitch: "8/12",
+    defaultOverhangInches: 12,
+    detachedGaragePolicy: "exclude",
+    attachedGaragePolicy: "include",
+    calibrationAdjustmentPercent: 10,
+    expectedErrorPercent: 15,
+    confidence: "Medium",
+    notes: "Newer suburban profile with attached garages and more complex rooflines.",
+  },
+  {
+    community: "Default Calgary",
+    buildEra: "unknown",
+    dominantHouseType: "detached residential",
+    defaultPitch: "6/12",
+    defaultOverhangInches: 12,
+    detachedGaragePolicy: "exclude",
+    attachedGaragePolicy: "include",
+    calibrationAdjustmentPercent: 5,
+    expectedErrorPercent: 18,
+    confidence: "Medium",
+    notes: "Fallback profile when the community has not been researched yet.",
+  },
+];
 
 function pitchMultiplierFor(pitch: PitchValue) {
   return PITCH_OPTIONS.find((option) => option.label === pitch)?.multiplier ?? 1.118;
@@ -318,6 +429,98 @@ function deriveRoofProfile(facets: Facet[]): AutoRoofProfile | null {
   };
 }
 
+function applyCommunityProfile(facets: Facet[], profile: CommunityProfile) {
+  return facets.map((facet) => {
+    const isDetachedGarage = facet.role === "Detached garage candidate";
+    const isAttachedCandidate = facet.role === "Attached roof candidate";
+    const shouldInclude =
+      facet.role === "Main roof" ||
+      (isAttachedCandidate && profile.attachedGaragePolicy === "include") ||
+      (isDetachedGarage && profile.detachedGaragePolicy === "include") ||
+      (!isDetachedGarage && !isAttachedCandidate && facet.included);
+
+    return {
+      ...facet,
+      pitch: shouldInclude ? profile.defaultPitch : facet.pitch,
+      included: shouldInclude,
+      includeReason: isDetachedGarage
+        ? `Community garage policy is ${profile.detachedGaragePolicy}. Detached garage candidate ${
+            shouldInclude ? "included" : "excluded"
+          }.`
+        : isAttachedCandidate
+          ? `Community attached garage policy is ${profile.attachedGaragePolicy}. Attached roof candidate ${
+              shouldInclude ? "included" : "excluded"
+            }.`
+          : facet.includeReason,
+    };
+  });
+}
+
+function summarizeFacets({
+  facets,
+  overhangInches,
+  calibrationAdjustmentPercent,
+  wasteFactor,
+}: {
+  facets: Facet[];
+  overhangInches: number;
+  calibrationAdjustmentPercent: number;
+  wasteFactor: number;
+}) {
+  const includedFacets = facets.filter((facet) => facet.included);
+  const buildingFootprintSqft = includedFacets.reduce(
+    (sum, facet) => sum + turfArea(facet.feature) * SQM_TO_SQFT,
+    0,
+  );
+  const overhangFootprintSqft = includedFacets.reduce(
+    (sum, facet) => sum + turfArea(applyOverhang(facet.feature, overhangInches)) * SQM_TO_SQFT,
+    0,
+  );
+  const baseRoofSqft = includedFacets.reduce((sum, facet) => {
+    const footprintSqft = turfArea(applyOverhang(facet.feature, overhangInches)) * SQM_TO_SQFT;
+
+    return sum + footprintSqft * pitchMultiplierFor(facet.pitch);
+  }, 0);
+  const roofSqft = baseRoofSqft * (1 + calibrationAdjustmentPercent / 100);
+  const wasteAdjustedSqft = roofSqft * (1 + wasteFactor / 100);
+
+  return {
+    buildingFootprintSqft,
+    overhangFootprintSqft,
+    roofSqft,
+    roofingSquares: roofSqft / 100,
+    wasteAdjustedSqft,
+    includedStructures: includedFacets.length,
+    excludedStructures: facets.length - includedFacets.length,
+  };
+}
+
+function flagsForEstimate(facets: Facet[], profile: CommunityProfile, expectedErrorPercent: number) {
+  const flags: string[] = [];
+
+  if (facets.length > 1) {
+    flags.push("multiple structures found");
+  }
+
+  if (facets.some((facet) => facet.role === "Detached garage candidate" && !facet.included)) {
+    flags.push("detached garage excluded");
+  }
+
+  if (profile.defaultPitch !== DEFAULT_PITCH) {
+    flags.push("community pitch override applied");
+  }
+
+  if (expectedErrorPercent >= 18) {
+    flags.push("wide error range");
+  }
+
+  if (facets.some((facet) => facet.role === "Nearby structure")) {
+    flags.push("nearby structure excluded");
+  }
+
+  return flags.length > 0 ? flags : ["standard community assumptions"];
+}
+
 function waitForMapIdle(map: mapboxgl.Map) {
   return new Promise<void>((resolve) => {
     if (map.loaded() && !map.isMoving()) {
@@ -481,6 +684,11 @@ export default function RoofCalibrationTool() {
   const [autoEstimateMessage, setAutoEstimateMessage] = useState("");
   const [autoRoofProfile, setAutoRoofProfile] = useState<AutoRoofProfile | null>(null);
   const [isSearching, setIsSearching] = useState(false);
+  const [selectedCommunity, setSelectedCommunity] = useState("Sandstone Valley");
+  const [batchAddresses, setBatchAddresses] = useState("");
+  const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
+  const [batchMessage, setBatchMessage] = useState("");
+  const [isBatchRunning, setIsBatchRunning] = useState(false);
 
   const syncFacetsFromDraw = useCallback(() => {
     const draw = drawRef.current;
@@ -787,6 +995,204 @@ export default function RoofCalibrationTool() {
     }
   };
 
+  const runBatchEstimate = async () => {
+    const profile =
+      COMMUNITY_PROFILES.find((item) => item.community === selectedCommunity) ??
+      COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
+    const addresses = batchAddresses
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .slice(0, 250);
+    const map = mapRef.current;
+
+    setBatchMessage("");
+    setBatchResults([]);
+
+    if (addresses.length === 0) {
+      setBatchMessage("Paste at least one address, one per line.");
+      return;
+    }
+
+    if (!mapboxToken || !map) {
+      setBatchMessage("Mapbox must be loaded before batch estimates can run.");
+      return;
+    }
+
+    setIsBatchRunning(true);
+
+    const results: BatchResult[] = [];
+
+    for (const [index, batchAddress] of addresses.entries()) {
+      setBatchMessage(`Estimating ${index + 1} of ${addresses.length}`);
+
+      try {
+        const response = await fetch(
+          `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(
+            batchAddress,
+          )}.json?access_token=${mapboxToken}&limit=1&types=address&proximity=-114.0719,51.0447`,
+        );
+
+        if (!response.ok) {
+          throw new Error("Mapbox geocoding failed.");
+        }
+
+        const data = (await response.json()) as {
+          features?: Array<{ center: [number, number]; place_name?: string }>;
+        };
+        const result = data.features?.[0];
+
+        if (!result) {
+          results.push({
+            id: crypto.randomUUID(),
+            address: batchAddress,
+            resolvedAddress: "",
+            community: profile.community,
+            latitude: null,
+            longitude: null,
+            buildingFootprintSqft: 0,
+            overhangFootprintSqft: 0,
+            roofSqft: 0,
+            roofingSquares: 0,
+            wasteAdjustedSqft: 0,
+            pitch: profile.defaultPitch,
+            pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
+            overhangInches: profile.defaultOverhangInches,
+            calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
+            buildEra: profile.buildEra,
+            houseType: profile.dominantHouseType,
+            garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
+            includedStructures: 0,
+            excludedStructures: 0,
+            confidence: "Unusable",
+            expectedErrorPercent: 100,
+            flags: ["geocode failed"],
+            assumptions: [profile.notes],
+            status: "Error",
+          });
+          setBatchResults([...results]);
+          continue;
+        }
+
+        const [lng, lat] = result.center;
+        map.flyTo({ center: [lng, lat], zoom: 19.5, essential: true });
+        await waitForMapIdle(map);
+
+        const estimate = findBuildingFootprints(map, [lng, lat]);
+
+        if (!estimate.ok) {
+          results.push({
+            id: crypto.randomUUID(),
+            address: batchAddress,
+            resolvedAddress: result.place_name ?? batchAddress,
+            community: profile.community,
+            latitude: lat,
+            longitude: lng,
+            buildingFootprintSqft: 0,
+            overhangFootprintSqft: 0,
+            roofSqft: 0,
+            roofingSquares: 0,
+            wasteAdjustedSqft: 0,
+            pitch: profile.defaultPitch,
+            pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
+            overhangInches: profile.defaultOverhangInches,
+            calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
+            buildEra: profile.buildEra,
+            houseType: profile.dominantHouseType,
+            garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
+            includedStructures: 0,
+            excludedStructures: 0,
+            confidence: "Unusable",
+            expectedErrorPercent: 100,
+            flags: ["no building footprint"],
+            assumptions: [estimate.reason, profile.notes],
+            status: "No footprint",
+          });
+          setBatchResults([...results]);
+          continue;
+        }
+
+        const profiledFacets = applyCommunityProfile(estimate.facets, profile);
+        const summary = summarizeFacets({
+          facets: profiledFacets,
+          overhangInches: profile.defaultOverhangInches,
+          calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
+          wasteFactor: Number(wasteFactor) || 0,
+        });
+        const expectedErrorPercent =
+          profile.expectedErrorPercent +
+          (summary.excludedStructures > 2 ? 4 : 0) +
+          (summary.includedStructures === 0 ? 50 : 0);
+        const flags = flagsForEstimate(profiledFacets, profile, expectedErrorPercent);
+
+        results.push({
+          id: crypto.randomUUID(),
+          address: batchAddress,
+          resolvedAddress: result.place_name ?? batchAddress,
+          community: profile.community,
+          latitude: lat,
+          longitude: lng,
+          buildingFootprintSqft: summary.buildingFootprintSqft,
+          overhangFootprintSqft: summary.overhangFootprintSqft,
+          roofSqft: summary.roofSqft,
+          roofingSquares: summary.roofingSquares,
+          wasteAdjustedSqft: summary.wasteAdjustedSqft,
+          pitch: profile.defaultPitch,
+          pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
+          overhangInches: profile.defaultOverhangInches,
+          calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
+          buildEra: profile.buildEra,
+          houseType: profile.dominantHouseType,
+          garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
+          includedStructures: summary.includedStructures,
+          excludedStructures: summary.excludedStructures,
+          confidence: expectedErrorPercent > 20 ? "Low" : profile.confidence,
+          expectedErrorPercent,
+          flags,
+          assumptions: [
+            profile.notes,
+            `Community profile used ${profile.defaultPitch} pitch, ${profile.defaultOverhangInches} inch overhang, ${profile.calibrationAdjustmentPercent} percent calibration.`,
+            ...profiledFacets.map((facet) => `${facet.role}: ${facet.includeReason}`),
+          ],
+          status: "Estimated",
+        });
+        setBatchResults([...results]);
+      } catch {
+        results.push({
+          id: crypto.randomUUID(),
+          address: batchAddress,
+          resolvedAddress: "",
+          community: profile.community,
+          latitude: null,
+          longitude: null,
+          buildingFootprintSqft: 0,
+          overhangFootprintSqft: 0,
+          roofSqft: 0,
+          roofingSquares: 0,
+          wasteAdjustedSqft: 0,
+          pitch: profile.defaultPitch,
+          pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
+          overhangInches: profile.defaultOverhangInches,
+          calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
+          buildEra: profile.buildEra,
+          houseType: profile.dominantHouseType,
+          garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
+          includedStructures: 0,
+          excludedStructures: 0,
+          confidence: "Unusable",
+          expectedErrorPercent: 100,
+          flags: ["estimate failed"],
+          assumptions: [profile.notes],
+          status: "Error",
+        });
+        setBatchResults([...results]);
+      }
+    }
+
+    setBatchMessage(`Finished ${results.length} estimate${results.length === 1 ? "" : "s"}.`);
+    setIsBatchRunning(false);
+  };
+
   const updateFacetPitch = (id: string, pitch: PitchValue) => {
     setFacets((currentFacets) =>
       currentFacets.map((facet) => (facet.id === id ? { ...facet, pitch } : facet)),
@@ -1007,6 +1413,72 @@ export default function RoofCalibrationTool() {
     URL.revokeObjectURL(url);
   };
 
+  const exportBatchCsv = () => {
+    const headers = [
+      "Address",
+      "Resolved address",
+      "Community",
+      "Latitude",
+      "Longitude",
+      "Building footprint sqft",
+      "Overhang footprint sqft",
+      "Roof sqft",
+      "Roofing squares",
+      "Waste adjusted sqft",
+      "Pitch",
+      "Pitch multiplier",
+      "Overhang inches",
+      "Calibration percent",
+      "Build era",
+      "House type",
+      "Garage policy",
+      "Included structures",
+      "Excluded structures",
+      "Confidence",
+      "Expected error percent",
+      "Flags",
+      "Assumptions",
+      "Status",
+    ];
+    const rows = batchResults.map((result) => [
+      result.address,
+      result.resolvedAddress,
+      result.community,
+      result.latitude ?? "",
+      result.longitude ?? "",
+      Math.round(result.buildingFootprintSqft),
+      Math.round(result.overhangFootprintSqft),
+      Math.round(result.roofSqft),
+      result.roofingSquares.toFixed(1),
+      Math.round(result.wasteAdjustedSqft),
+      result.pitch,
+      result.pitchMultiplier,
+      result.overhangInches,
+      result.calibrationAdjustmentPercent,
+      result.buildEra,
+      result.houseType,
+      result.garagePolicy,
+      result.includedStructures,
+      result.excludedStructures,
+      result.confidence,
+      result.expectedErrorPercent,
+      result.flags.join("; "),
+      result.assumptions.join("; "),
+      result.status,
+    ]);
+    const csv = [headers, ...rows]
+      .map((row) => row.map((cell) => csvEscape(cell)).join(","))
+      .join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = `${selectedCommunity.toLowerCase().replaceAll(" ", "-")}-roof-estimates.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
   const existingValue = parseOptionalPositive(existingToolSqft);
   const existingInputInvalid = Number.isNaN(existingValue);
   const wasteValue = Number(wasteFactor);
@@ -1017,6 +1489,9 @@ export default function RoofCalibrationTool() {
   const calibrationValue = Number(calibrationAdjustmentPercent);
   const calibrationInvalid =
     !Number.isFinite(calibrationValue) || calibrationValue < -30 || calibrationValue > 30;
+  const currentCommunityProfile =
+    COMMUNITY_PROFILES.find((profile) => profile.community === selectedCommunity) ??
+    COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
 
   return (
     <main className="min-h-screen bg-[#f4f6f5] text-slate-900">
@@ -1128,6 +1603,131 @@ export default function RoofCalibrationTool() {
               className="min-h-10 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm font-normal normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
             />
           </label>
+        </section>
+
+        <section className="grid gap-3 rounded-md border border-slate-200 bg-white p-3 shadow-sm xl:grid-cols-[360px_minmax(0,1fr)]">
+          <div className="grid gap-3">
+            <div>
+              <h2 className="text-base font-semibold text-slate-950">
+                Community Batch Estimator
+              </h2>
+              <p className="text-xs text-slate-500">
+                Run one Calgary community at a time with shared pitch, garage, and calibration assumptions.
+              </p>
+            </div>
+
+            <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
+              Community profile
+              <select
+                value={selectedCommunity}
+                onChange={(event) => setSelectedCommunity(event.target.value)}
+                className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+              >
+                {COMMUNITY_PROFILES.map((profile) => (
+                  <option key={profile.community} value={profile.community}>
+                    {profile.community}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <div className="grid grid-cols-2 gap-2">
+              <Readout label="Build era" value={currentCommunityProfile.buildEra} />
+              <Readout label="House type" value={currentCommunityProfile.dominantHouseType} />
+              <Readout label="Pitch override" value={currentCommunityProfile.defaultPitch} />
+              <Readout
+                label="Expected error"
+                value={`+/- ${formatNumber(currentCommunityProfile.expectedErrorPercent)} percent`}
+              />
+              <Readout
+                label="Detached garage"
+                value={currentCommunityProfile.detachedGaragePolicy}
+              />
+              <Readout
+                label="Calibration"
+                value={`${formatNumber(currentCommunityProfile.calibrationAdjustmentPercent)} percent`}
+              />
+            </div>
+            <p className="rounded-md bg-slate-50 p-2 text-xs font-medium text-slate-600">
+              {currentCommunityProfile.notes}
+            </p>
+          </div>
+
+          <div className="grid gap-3">
+            <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
+              Addresses
+              <textarea
+                value={batchAddresses}
+                onChange={(event) => setBatchAddresses(event.target.value)}
+                rows={7}
+                placeholder={"One address per line\n123 Sandstone Dr NW, Calgary, AB\n124 Sandstone Dr NW, Calgary, AB"}
+                className="resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
+              />
+            </label>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={() => void runBatchEstimate()}
+                disabled={isBatchRunning}
+                className="h-10 rounded-md bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+              >
+                {isBatchRunning ? "Running Batch" : "Run Batch Estimate"}
+              </button>
+              <button
+                onClick={exportBatchCsv}
+                disabled={batchResults.length === 0}
+                className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400"
+              >
+                Export Batch CSV
+              </button>
+              {batchMessage ? (
+                <span className="text-xs font-semibold text-slate-600">{batchMessage}</span>
+              ) : null}
+            </div>
+
+            {batchResults.length > 0 ? (
+              <div className="max-h-[360px] overflow-auto rounded-md border border-slate-200">
+                <table className="w-full min-w-[1180px] border-collapse text-left text-xs">
+                  <thead className="sticky top-0 bg-slate-50 uppercase tracking-normal text-slate-500">
+                    <tr className="border-b border-slate-200">
+                      <TableHeader>Address</TableHeader>
+                      <TableHeader>Roof sqft</TableHeader>
+                      <TableHeader>Pitch</TableHeader>
+                      <TableHeader>House type</TableHeader>
+                      <TableHeader>Garage policy</TableHeader>
+                      <TableHeader>Confidence</TableHeader>
+                      <TableHeader>Error</TableHeader>
+                      <TableHeader>Flags</TableHeader>
+                      <TableHeader>Status</TableHeader>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {batchResults.map((result) => (
+                      <tr key={result.id} className="border-b border-slate-100">
+                        <TableCell>
+                          <span className="block max-w-[300px] truncate font-semibold text-slate-900">
+                            {result.address}
+                          </span>
+                        </TableCell>
+                        <TableCell>{formatNumber(result.roofSqft)} sqft</TableCell>
+                        <TableCell>{result.pitch}</TableCell>
+                        <TableCell>{result.houseType}</TableCell>
+                        <TableCell>{result.garagePolicy}</TableCell>
+                        <TableCell>{result.confidence}</TableCell>
+                        <TableCell>+/- {formatNumber(result.expectedErrorPercent)}%</TableCell>
+                        <TableCell>
+                          <span className="block max-w-[260px] truncate">
+                            {result.flags.join("; ")}
+                          </span>
+                        </TableCell>
+                        <TableCell>{result.status}</TableCell>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+          </div>
         </section>
 
         <section className="grid min-h-[620px] gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
