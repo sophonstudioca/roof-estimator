@@ -18,6 +18,12 @@ type RoofFeature = Feature<Polygon | MultiPolygon>;
 type PitchValue = "3/12" | "4/12" | "6/12" | "8/12" | "10/12" | "12/12";
 type Confidence = "High" | "Medium" | "Low" | "Unusable";
 type Status = "Pass" | "Review" | "Fail";
+type StructureRole =
+  | "Main roof"
+  | "Attached roof candidate"
+  | "Detached garage candidate"
+  | "Small outbuilding"
+  | "Nearby structure";
 
 type Facet = {
   id: string;
@@ -25,6 +31,8 @@ type Facet = {
   pitch: PitchValue;
   included: boolean;
   source: "address" | "nearby" | "saved";
+  role: StructureRole;
+  includeReason: string;
 };
 
 type CalculatedFacet = Facet & {
@@ -46,6 +54,8 @@ type SavedMeasurement = {
     pitch: PitchValue;
     included: boolean;
     source: "address" | "nearby" | "saved";
+    role: StructureRole;
+    includeReason: string;
     buildingFootprintSqft: number;
     footprintSqft: number;
     roofSurfaceSqft: number;
@@ -74,6 +84,16 @@ type AutoEstimateResult =
       source: string;
     }
   | { ok: false; reason: string };
+
+type AutoRoofProfile = {
+  label: string;
+  pitch: PitchValue;
+  overhangInches: number;
+  calibrationAdjustmentPercent: number;
+  confidence: Confidence;
+  expectedErrorPercent: number;
+  reasons: string[];
+};
 
 const SQM_TO_SQFT = 10.7639;
 const DEFAULT_PITCH: PitchValue = "6/12";
@@ -174,6 +194,127 @@ function applyOverhang(feature: RoofFeature, overhangInches: number): RoofFeatur
     id: feature.id,
     properties: feature.properties ?? {},
     geometry: buffered.geometry,
+  };
+}
+
+function countVertices(feature: RoofFeature) {
+  if (feature.geometry.type === "Polygon") {
+    return feature.geometry.coordinates.flat().length;
+  }
+
+  return feature.geometry.coordinates.flat(2).length;
+}
+
+function classifyStructure({
+  areaSqft,
+  distanceFromAddressMeters,
+  containsAddressPoint,
+  index,
+}: {
+  areaSqft: number;
+  distanceFromAddressMeters: number;
+  containsAddressPoint: boolean;
+  index: number;
+}): { role: StructureRole; included: boolean; includeReason: string } {
+  if (index === 0) {
+    return {
+      role: "Main roof",
+      included: true,
+      includeReason: containsAddressPoint
+        ? "Closest footprint contains the geocoded address point."
+        : "Closest footprint to the geocoded address point.",
+    };
+  }
+
+  if (areaSqft < 220) {
+    return {
+      role: "Small outbuilding",
+      included: false,
+      includeReason: "Small nearby footprint excluded from the automatic total.",
+    };
+  }
+
+  if (distanceFromAddressMeters <= 16 && areaSqft >= 280 && areaSqft <= 1200) {
+    return {
+      role: "Attached roof candidate",
+      included: true,
+      includeReason: "Close garage-scale footprint included as likely attached roof area.",
+    };
+  }
+
+  if (areaSqft >= 280 && areaSqft <= 1100) {
+    return {
+      role: "Detached garage candidate",
+      included: false,
+      includeReason: "Garage-scale footprint excluded unless the roof report includes detached garages.",
+    };
+  }
+
+  return {
+    role: "Nearby structure",
+    included: false,
+    includeReason: "Nearby footprint excluded to avoid counting the wrong structure.",
+  };
+}
+
+function deriveRoofProfile(facets: Facet[]): AutoRoofProfile | null {
+  const includedFacets = facets.filter((facet) => facet.included);
+
+  if (includedFacets.length === 0) {
+    return null;
+  }
+
+  const includedFootprintSqft = includedFacets.reduce(
+    (sum, facet) => sum + turfArea(facet.feature) * SQM_TO_SQFT,
+    0,
+  );
+  const vertexCount = includedFacets.reduce((sum, facet) => sum + countVertices(facet.feature), 0);
+  const nearbyCount = facets.length - includedFacets.length;
+  const roleSummary = includedFacets.map((facet) => facet.role).join(", ");
+  const reasons = [
+    `${includedFacets.length} included structure${includedFacets.length === 1 ? "" : "s"}: ${roleSummary}.`,
+  ];
+
+  if (nearbyCount > 0) {
+    reasons.push(`${nearbyCount} nearby footprint${nearbyCount === 1 ? "" : "s"} excluded by default.`);
+  }
+
+  if (includedFootprintSqft < 900) {
+    reasons.push("Small footprint profile uses a lower pitch assumption and wider error band.");
+    return {
+      label: "Small low-complexity roof",
+      pitch: "4/12",
+      overhangInches: 10,
+      calibrationAdjustmentPercent: 2,
+      confidence: "Low",
+      expectedErrorPercent: nearbyCount > 0 ? 22 : 18,
+      reasons,
+    };
+  }
+
+  if (includedFootprintSqft > 3200 || vertexCount > 18 || includedFacets.length > 1) {
+    reasons.push("Large or irregular footprint profile uses steeper pitch and positive calibration.");
+    return {
+      label: "Large or complex roof",
+      pitch: "8/12",
+      overhangInches: 12,
+      calibrationAdjustmentPercent: 8,
+      confidence: nearbyCount > 2 ? "Low" : "Medium",
+      expectedErrorPercent: nearbyCount > 2 ? 24 : 18,
+      reasons,
+    };
+  }
+
+  reasons.push("Standard detached-home profile uses 6/12 pitch and modest calibration.");
+
+  return {
+    label: "Standard detached home",
+    pitch: "6/12",
+    overhangInches: 12,
+    calibrationAdjustmentPercent: 4,
+    confidence: nearbyCount > 2 ? "Medium" : "High",
+    expectedErrorPercent: nearbyCount > 2 ? 16 : 12,
+    reasons,
   };
 }
 
@@ -278,20 +419,31 @@ function findBuildingFootprints(
     )
     .slice(0, 6);
 
-  const facets = selectedCandidates.map((candidate, index) => ({
-    id: `auto-footprint-${index + 1}`,
-    feature: {
-      ...candidate.feature,
+  const facets = selectedCandidates.map((candidate, index) => {
+    const classification = classifyStructure({
+      areaSqft: candidate.areaSqft,
+      distanceFromAddressMeters: candidate.distanceFromAddressMeters,
+      containsAddressPoint: candidate.containsAddressPoint,
+      index,
+    });
+
+    return {
       id: `auto-footprint-${index + 1}`,
-      properties: {
-        ...(candidate.feature.properties ?? {}),
-        distanceFromAddressMeters: candidate.distanceFromAddressMeters,
+      feature: {
+        ...candidate.feature,
+        id: `auto-footprint-${index + 1}`,
+        properties: {
+          ...(candidate.feature.properties ?? {}),
+          distanceFromAddressMeters: candidate.distanceFromAddressMeters,
+        },
       },
-    },
-    pitch: DEFAULT_PITCH,
-    included: index === 0,
-    source: candidate.containsAddressPoint ? "address" : "nearby",
-  })) satisfies Facet[];
+      pitch: DEFAULT_PITCH,
+      included: classification.included,
+      source: candidate.containsAddressPoint ? "address" : "nearby",
+      role: classification.role,
+      includeReason: classification.includeReason,
+    };
+  }) satisfies Facet[];
 
   return {
     ok: true,
@@ -327,6 +479,7 @@ export default function RoofCalibrationTool() {
   const [searchError, setSearchError] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
   const [autoEstimateMessage, setAutoEstimateMessage] = useState("");
+  const [autoRoofProfile, setAutoRoofProfile] = useState<AutoRoofProfile | null>(null);
   const [isSearching, setIsSearching] = useState(false);
 
   const syncFacetsFromDraw = useCallback(() => {
@@ -351,6 +504,8 @@ export default function RoofCalibrationTool() {
           pitch: currentFacet?.pitch ?? DEFAULT_PITCH,
           included: currentFacet?.included ?? true,
           source: currentFacet?.source ?? "nearby",
+          role: currentFacet?.role ?? "Nearby structure",
+          includeReason: currentFacet?.includeReason ?? "Map feature restored from drawing state.",
         };
       });
     });
@@ -544,6 +699,7 @@ export default function RoofCalibrationTool() {
     setSearchError("");
     setSaveMessage("");
     setAutoEstimateMessage("");
+    setAutoRoofProfile(null);
 
     if (!address.trim()) {
       setSearchError("Address is required before map search.");
@@ -596,15 +752,31 @@ export default function RoofCalibrationTool() {
         const autoEstimate = findBuildingFootprints(map, [lng, lat]);
 
         if (autoEstimate.ok) {
+          const profile = deriveRoofProfile(autoEstimate.facets);
+          const profiledFacets = profile
+            ? autoEstimate.facets.map((facet) => ({
+                ...facet,
+                pitch: facet.included ? profile.pitch : facet.pitch,
+              }))
+            : autoEstimate.facets;
+
           drawRef.current?.deleteAll();
-          autoEstimate.facets.forEach((facet) => drawRef.current?.add(facet.feature));
-          setFacets(autoEstimate.facets);
-          setConfidence("Medium");
+          profiledFacets.forEach((facet) => drawRef.current?.add(facet.feature));
+          setFacets(profiledFacets);
+          if (profile) {
+            setOverhangInches(String(profile.overhangInches));
+            setCalibrationAdjustmentPercent(String(profile.calibrationAdjustmentPercent));
+            setConfidence(profile.confidence);
+            setAutoRoofProfile(profile);
+          } else {
+            setConfidence("Medium");
+          }
           setAutoEstimateMessage(autoEstimate.source);
         } else {
           drawRef.current?.deleteAll();
           setFacets([]);
           setConfidence("Unusable");
+          setAutoRoofProfile(null);
           setAutoEstimateMessage(autoEstimate.reason);
         }
       }
@@ -703,6 +875,8 @@ export default function RoofCalibrationTool() {
         pitch: facet.pitch,
         included: facet.included,
         source: facet.source,
+        role: facet.role,
+        includeReason: facet.includeReason,
         buildingFootprintSqft: facet.buildingFootprintSqft,
         footprintSqft: facet.footprintSqft,
         roofSurfaceSqft: facet.roofSurfaceSqft,
@@ -755,8 +929,11 @@ export default function RoofCalibrationTool() {
         pitch: facet.pitch,
         included: facet.included ?? true,
         source: facet.source ?? "saved",
+        role: facet.role ?? "Nearby structure",
+        includeReason: facet.includeReason ?? "Loaded from a saved measurement.",
       })),
     );
+    setAutoRoofProfile(null);
     setSaveMessage("Loaded saved measurement.");
 
     if (mapRef.current) {
@@ -984,7 +1161,7 @@ export default function RoofCalibrationTool() {
                           Structure {index + 1}
                         </span>
                         <p className="text-[11px] font-medium text-slate-500">
-                          {facet.source === "address" ? "Address match" : "Nearby structure"}
+                          {facet.role}
                           {facet.distanceFromAddressMeters !== null
                             ? `, ${formatNumber(facet.distanceFromAddressMeters, 0)} m away`
                             : ""}
@@ -1010,6 +1187,9 @@ export default function RoofCalibrationTool() {
                         </button>
                       </div>
                     </div>
+                    <p className="rounded-md bg-white px-2 py-1 text-[11px] font-medium text-slate-600">
+                      {facet.includeReason}
+                    </p>
 
                     <div className="grid grid-cols-2 gap-2 text-xs">
                       <Readout
@@ -1052,6 +1232,40 @@ export default function RoofCalibrationTool() {
                   </div>
                 ))}
               </div>
+            </Panel>
+
+            <Panel title="Accuracy Engine">
+              {autoRoofProfile ? (
+                <div className="grid gap-2">
+                  <div className="grid grid-cols-2 gap-2">
+                    <Readout label="Auto profile" value={autoRoofProfile.label} strong />
+                    <Readout
+                      label="Expected error"
+                      value={`+/- ${formatNumber(autoRoofProfile.expectedErrorPercent)} percent`}
+                      strong
+                    />
+                    <Readout label="Auto pitch" value={autoRoofProfile.pitch} />
+                    <Readout
+                      label="Auto adjustment"
+                      value={`${formatNumber(autoRoofProfile.calibrationAdjustmentPercent)} percent`}
+                    />
+                  </div>
+                  <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
+                    {autoRoofProfile.reasons.map((reason) => (
+                      <p key={reason} className="text-xs font-medium text-slate-600">
+                        {reason}
+                      </p>
+                    ))}
+                    <p className="mt-1 text-xs font-semibold text-slate-700">
+                      This is still footprint-based, not AI roof-plane segmentation.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <p className="text-sm text-slate-600">
+                  Estimate an address to generate an automatic roof profile, confidence band, and adjustment reasons.
+                </p>
+              )}
             </Panel>
 
             <Panel title="Output Summary">
