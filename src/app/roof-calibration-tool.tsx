@@ -2,23 +2,27 @@
 
 import {
   area as turfArea,
+  bbox as turfBbox,
   booleanPointInPolygon,
   buffer as turfBuffer,
   center as turfCenter,
   distance as turfDistance,
   point as turfPoint,
 } from "@turf/turf";
-import MapboxDraw from "@mapbox/mapbox-gl-draw";
 import type { Feature, FeatureCollection, Geometry, MultiPolygon, Polygon } from "geojson";
 import mapboxgl from "mapbox-gl";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type RoofFeature = Feature<Polygon | MultiPolygon>;
+type ParcelFeature = Feature<MultiPolygon, ParcelProperties>;
 
 type PitchValue = "3/12" | "4/12" | "6/12" | "8/12" | "10/12" | "12/12";
 type Confidence = "High" | "Medium" | "Low" | "Unusable";
-type Status = "Pass" | "Review" | "Fail";
 type GaragePolicy = "auto" | "include" | "exclude";
+type AttachedGaragePolicy = "include" | "exclude";
+type DwellingType = "Single detached" | "Duplex";
+type EstimateStatus = "Loaded" | "Estimating" | "Estimated" | "No footprint" | "Error";
+type AgeBand = "Pre-1950" | "1950-1969" | "1970-1989" | "1990-2009" | "2010+" | "Unknown";
 type StructureRole =
   | "Main roof"
   | "Attached roof candidate"
@@ -26,56 +30,91 @@ type StructureRole =
   | "Small outbuilding"
   | "Nearby structure";
 
+type CalgaryAssessmentRow = {
+  address?: string;
+  comm_name?: string;
+  year_of_construction?: string;
+  land_use_designation?: string;
+  property_type?: string;
+  sub_property_use?: string;
+  assessment_class?: string;
+  assessment_class_description?: string;
+  multipolygon?: MultiPolygon;
+  unique_key?: string;
+  cpid?: string;
+  roll_number?: string;
+};
+
+type GroupedSummaryRow = {
+  comm_name?: string;
+  sub_property_use?: string;
+  year_of_construction?: string;
+  count?: string;
+};
+
+type AgeTypeBreakdown = Record<AgeBand, Record<DwellingType, number>>;
+
+type CommunitySummary = {
+  community: string;
+  singleDetachedCount: number;
+  duplexCount: number;
+  total: number;
+  averageYear: number | null;
+  oldestYear: number | null;
+  priorityScore: number;
+  ageTypeBreakdown: AgeTypeBreakdown;
+};
+
+type CommunityAssumptions = {
+  pitch: PitchValue;
+  overhangInches: number;
+  calibrationPercent: number;
+  detachedGaragePolicy: GaragePolicy;
+  attachedGaragePolicy: AttachedGaragePolicy;
+  wasteFactor: number;
+  includeDuplexes: boolean;
+};
+
+type EligibleAddress = {
+  id: string;
+  address: string;
+  community: string;
+  dwellingType: DwellingType;
+  classificationSource: string;
+  constructionYear: number | null;
+  ageBand: AgeBand;
+  landUse: string;
+  propertyType: string;
+  assessmentClass: string;
+  assessmentClassDescription: string;
+  subPropertyUse: string;
+  uniqueKey: string;
+  cpid: string;
+  rollNumber: string;
+  latitude: number | null;
+  longitude: number | null;
+  parcel: ParcelFeature | null;
+  sourceRow: CalgaryAssessmentRow;
+};
+
+type ParcelProperties = {
+  id: string;
+  address: string;
+  community: string;
+  dwellingType: DwellingType;
+  ageBand: AgeBand;
+  constructionYear: number | null;
+  subPropertyUse: string;
+};
+
 type Facet = {
   id: string;
   feature: RoofFeature;
   pitch: PitchValue;
   included: boolean;
-  source: "address" | "nearby" | "saved";
+  source: "address" | "nearby";
   role: StructureRole;
   includeReason: string;
-};
-
-type CalculatedFacet = Facet & {
-  buildingFootprintSqft: number;
-  footprintSqft: number;
-  pitchMultiplier: number;
-  roofSurfaceSqft: number;
-  distanceFromAddressMeters: number | null;
-};
-
-type SavedMeasurement = {
-  id: string;
-  address: string;
-  latitude: number;
-  longitude: number;
-  facets: Array<{
-    id: string;
-    feature: RoofFeature;
-    pitch: PitchValue;
-    included: boolean;
-    source: "address" | "nearby" | "saved";
-    role: StructureRole;
-    includeReason: string;
-    buildingFootprintSqft: number;
-    footprintSqft: number;
-    roofSurfaceSqft: number;
-  }>;
-  totalFootprintSqft: number;
-  totalRoofSurfaceSqft: number;
-  wasteFactor: number;
-  overhangInches: number;
-  calibrationAdjustmentPercent: number;
-  wasteAdjustedSqft: number;
-  roofingSquares: number;
-  existingToolSqft: number | null;
-  existingToolIncludesWaste: boolean;
-  differenceSqft: number | null;
-  differencePercent: number | null;
-  status: Status | null;
-  confidence: Confidence;
-  notes: string;
-  createdAt: string;
 };
 
 type AutoEstimateResult =
@@ -86,64 +125,72 @@ type AutoEstimateResult =
     }
   | { ok: false; reason: string };
 
-type AutoRoofProfile = {
-  label: string;
-  pitch: PitchValue;
-  overhangInches: number;
-  calibrationAdjustmentPercent: number;
-  confidence: Confidence;
-  expectedErrorPercent: number;
-  reasons: string[];
-};
-
-type CommunityProfile = {
-  community: string;
-  buildEra: string;
-  dominantHouseType: string;
-  defaultPitch: PitchValue;
-  defaultOverhangInches: number;
-  detachedGaragePolicy: GaragePolicy;
-  attachedGaragePolicy: "include" | "exclude";
-  calibrationAdjustmentPercent: number;
-  expectedErrorPercent: number;
-  confidence: Confidence;
-  notes: string;
+type HouseOverride = {
+  pitch?: PitchValue;
+  overhangInches?: number;
+  calibrationPercent?: number;
+  detachedGaragePolicy?: GaragePolicy;
+  attachedGaragePolicy?: AttachedGaragePolicy;
+  wasteFactor?: number;
+  confidence?: Confidence;
+  notes?: string;
+  facetOverrides?: Record<string, { included?: boolean; pitch?: PitchValue }>;
 };
 
 type BatchResult = {
   id: string;
-  address: string;
-  resolvedAddress: string;
-  community: string;
-  latitude: number | null;
-  longitude: number | null;
+  address: EligibleAddress;
+  baseFacets: Facet[];
+  facets: Facet[];
+  sourceMessage: string;
   buildingFootprintSqft: number;
   overhangFootprintSqft: number;
   roofSqft: number;
   roofingSquares: number;
   wasteAdjustedSqft: number;
   pitch: PitchValue;
-  pitchMultiplier: number;
   overhangInches: number;
-  calibrationAdjustmentPercent: number;
-  buildEra: string;
-  houseType: string;
-  garagePolicy: string;
-  includedStructures: number;
-  excludedStructures: number;
+  calibrationPercent: number;
+  wasteFactor: number;
+  detachedGaragePolicy: GaragePolicy;
+  attachedGaragePolicy: AttachedGaragePolicy;
   confidence: Confidence;
   expectedErrorPercent: number;
   flags: string[];
   assumptions: string[];
-  facets: Facet[];
-  status: "Estimated" | "No footprint" | "Error";
+  includedStructures: number;
+  excludedStructures: number;
+  status: EstimateStatus;
 };
 
+const SOCRATA_ENDPOINT = "https://data.calgary.ca/resource/4bsw-nn7w.json";
 const SQM_TO_SQFT = 10.7639;
-const DEFAULT_PITCH: PitchValue = "6/12";
-const STORAGE_KEY = "roof-sqft-calibration-measurements-v1";
+const DEFAULT_ASSUMPTIONS: CommunityAssumptions = {
+  pitch: "6/12",
+  overhangInches: 12,
+  calibrationPercent: 5,
+  detachedGaragePolicy: "exclude",
+  attachedGaragePolicy: "include",
+  wasteFactor: 10,
+  includeDuplexes: true,
+};
+const OVERRIDES_STORAGE_KEY = "calgary-community-roof-overrides-v1";
 const BUILDING_SOURCE_ID = "auto-building-source";
 const BUILDING_FOOTPRINT_LAYER_ID = "auto-building-footprints";
+const PARCEL_SOURCE_ID = "eligible-parcels-source";
+const PARCEL_FILL_LAYER_ID = "eligible-parcels-fill";
+const PARCEL_LINE_LAYER_ID = "eligible-parcels-line";
+const SELECTED_PARCEL_SOURCE_ID = "selected-parcel-source";
+const SELECTED_PARCEL_FILL_LAYER_ID = "selected-parcel-fill";
+const SELECTED_PARCEL_LINE_LAYER_ID = "selected-parcel-line";
+const SELECTED_ROOF_SOURCE_ID = "selected-roof-source";
+const SELECTED_ROOF_FILL_LAYER_ID = "selected-roof-fill";
+const SELECTED_ROOF_LINE_LAYER_ID = "selected-roof-line";
+
+const EMPTY_FEATURE_COLLECTION: FeatureCollection = {
+  type: "FeatureCollection",
+  features: [],
+};
 
 const PITCH_OPTIONS: Array<{ label: PitchValue; multiplier: number }> = [
   { label: "3/12", multiplier: 1.031 },
@@ -154,79 +201,13 @@ const PITCH_OPTIONS: Array<{ label: PitchValue; multiplier: number }> = [
   { label: "12/12", multiplier: 1.414 },
 ];
 
-const CONFIDENCE_HELP: Record<Confidence, string> = {
-  High: "Clear image, simple roof, known pitch",
-  Medium: "Clear image, assumed pitch or moderate complexity",
-  Low: "Trees, shadows, complex roof, or uncertain pitch",
-  Unusable: "Roof cannot be measured reliably",
-};
-
-const COMMUNITY_PROFILES: CommunityProfile[] = [
-  {
-    community: "Sandstone Valley",
-    buildEra: "1980s-1990s",
-    dominantHouseType: "two-storey detached",
-    defaultPitch: "8/12",
-    defaultOverhangInches: 12,
-    detachedGaragePolicy: "exclude",
-    attachedGaragePolicy: "include",
-    calibrationAdjustmentPercent: 8,
-    expectedErrorPercent: 14,
-    confidence: "Medium",
-    notes: "Suburban north Calgary profile with many attached garages and moderately steep rooflines.",
-  },
-  {
-    community: "Acadia",
-    buildEra: "1950s-1960s",
-    dominantHouseType: "bungalow",
-    defaultPitch: "4/12",
-    defaultOverhangInches: 14,
-    detachedGaragePolicy: "exclude",
-    attachedGaragePolicy: "include",
-    calibrationAdjustmentPercent: 4,
-    expectedErrorPercent: 16,
-    confidence: "Medium",
-    notes: "Older bungalow profile. Detached rear garages are common and excluded by default.",
-  },
-  {
-    community: "Bowness",
-    buildEra: "mixed older and infill",
-    dominantHouseType: "bungalow and infill mix",
-    defaultPitch: "6/12",
-    defaultOverhangInches: 14,
-    detachedGaragePolicy: "exclude",
-    attachedGaragePolicy: "include",
-    calibrationAdjustmentPercent: 6,
-    expectedErrorPercent: 20,
-    confidence: "Low",
-    notes: "Mixed housing stock and mature trees increase variance.",
-  },
-  {
-    community: "Mahogany",
-    buildEra: "2010s-2020s",
-    dominantHouseType: "newer two-storey detached",
-    defaultPitch: "8/12",
-    defaultOverhangInches: 12,
-    detachedGaragePolicy: "exclude",
-    attachedGaragePolicy: "include",
-    calibrationAdjustmentPercent: 10,
-    expectedErrorPercent: 15,
-    confidence: "Medium",
-    notes: "Newer suburban profile with attached garages and more complex rooflines.",
-  },
-  {
-    community: "Default Calgary",
-    buildEra: "unknown",
-    dominantHouseType: "detached residential",
-    defaultPitch: "6/12",
-    defaultOverhangInches: 12,
-    detachedGaragePolicy: "exclude",
-    attachedGaragePolicy: "include",
-    calibrationAdjustmentPercent: 5,
-    expectedErrorPercent: 18,
-    confidence: "Medium",
-    notes: "Fallback profile when the community has not been researched yet.",
-  },
+const AGE_BANDS: AgeBand[] = [
+  "Pre-1950",
+  "1950-1969",
+  "1970-1989",
+  "1990-2009",
+  "2010+",
+  "Unknown",
 ];
 
 function pitchMultiplierFor(pitch: PitchValue) {
@@ -240,45 +221,6 @@ function formatNumber(value: number, digits = 0) {
   }).format(value);
 }
 
-function parseOptionalPositive(value: string) {
-  if (!value.trim()) {
-    return null;
-  }
-
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : Number.NaN;
-}
-
-function statusForDifference(differencePercent: number): Status {
-  const absoluteDifference = Math.abs(differencePercent);
-
-  if (absoluteDifference <= 10) {
-    return "Pass";
-  }
-
-  if (absoluteDifference <= 15) {
-    return "Review";
-  }
-
-  return "Fail";
-}
-
-function getStatusClasses(status: Status | null) {
-  if (status === "Pass") {
-    return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  }
-
-  if (status === "Review") {
-    return "border-amber-200 bg-amber-50 text-amber-800";
-  }
-
-  if (status === "Fail") {
-    return "border-red-200 bg-red-50 text-red-700";
-  }
-
-  return "border-slate-200 bg-slate-50 text-slate-600";
-}
-
 function csvEscape(value: unknown) {
   if (value === null || value === undefined) {
     return "";
@@ -286,6 +228,93 @@ function csvEscape(value: unknown) {
 
   const raw = String(value);
   return /[",\n]/.test(raw) ? `"${raw.replaceAll('"', '""')}"` : raw;
+}
+
+function ageBandFor(year: number | null): AgeBand {
+  if (!year) {
+    return "Unknown";
+  }
+
+  if (year < 1950) {
+    return "Pre-1950";
+  }
+
+  if (year < 1970) {
+    return "1950-1969";
+  }
+
+  if (year < 1990) {
+    return "1970-1989";
+  }
+
+  if (year < 2010) {
+    return "1990-2009";
+  }
+
+  return "2010+";
+}
+
+function createEmptyBreakdown(): AgeTypeBreakdown {
+  return AGE_BANDS.reduce((bands, band) => {
+    bands[band] = {
+      "Single detached": 0,
+      Duplex: 0,
+    };
+    return bands;
+  }, {} as AgeTypeBreakdown);
+}
+
+function dwellingTypeForCode(code: string | undefined): DwellingType | null {
+  if (code === "R110") {
+    return "Single detached";
+  }
+
+  if (code === "R120") {
+    return "Duplex";
+  }
+
+  return null;
+}
+
+function classificationLabel(code: string | undefined) {
+  if (code === "R110") {
+    return "Inferred from Calgary sub_property_use R110";
+  }
+
+  if (code === "R120") {
+    return "Inferred from Calgary sub_property_use R120";
+  }
+
+  return "Excluded until this Calgary sub_property_use code is mapped with confidence";
+}
+
+function parseYear(value: string | undefined) {
+  if (!value) {
+    return null;
+  }
+
+  const parsed = Math.round(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function escapeSoqlLiteral(value: string) {
+  return value.replaceAll("'", "''");
+}
+
+function buildSocrataUrl(params: Record<string, string | number>) {
+  const url = new URL(SOCRATA_ENDPOINT);
+
+  Object.entries(params).forEach(([key, value]) => {
+    url.searchParams.set(key, String(value));
+  });
+
+  return url.toString();
+}
+
+function isRoofGeometry(
+  geometry: Geometry | null | undefined,
+): geometry is Polygon | MultiPolygon {
+  return geometry?.type === "Polygon" || geometry?.type === "MultiPolygon";
 }
 
 function applyOverhang(feature: RoofFeature, overhangInches: number): RoofFeature {
@@ -309,14 +338,6 @@ function applyOverhang(feature: RoofFeature, overhangInches: number): RoofFeatur
   };
 }
 
-function countVertices(feature: RoofFeature) {
-  if (feature.geometry.type === "Polygon") {
-    return feature.geometry.coordinates.flat().length;
-  }
-
-  return feature.geometry.coordinates.flat(2).length;
-}
-
 function classifyStructure({
   areaSqft,
   distanceFromAddressMeters,
@@ -333,8 +354,8 @@ function classifyStructure({
       role: "Main roof",
       included: true,
       includeReason: containsAddressPoint
-        ? "Closest footprint contains the geocoded address point."
-        : "Closest footprint to the geocoded address point.",
+        ? "Closest footprint contains the Calgary parcel centroid."
+        : "Closest footprint to the Calgary parcel centroid.",
     };
   }
 
@@ -358,7 +379,7 @@ function classifyStructure({
     return {
       role: "Detached garage candidate",
       included: false,
-      includeReason: "Garage-scale footprint excluded unless the roof report includes detached garages.",
+      includeReason: "Garage-scale footprint excluded unless detached garages are included.",
     };
   }
 
@@ -366,206 +387,6 @@ function classifyStructure({
     role: "Nearby structure",
     included: false,
     includeReason: "Nearby footprint excluded to avoid counting the wrong structure.",
-  };
-}
-
-function deriveRoofProfile(facets: Facet[]): AutoRoofProfile | null {
-  const includedFacets = facets.filter((facet) => facet.included);
-
-  if (includedFacets.length === 0) {
-    return null;
-  }
-
-  const includedFootprintSqft = includedFacets.reduce(
-    (sum, facet) => sum + turfArea(facet.feature) * SQM_TO_SQFT,
-    0,
-  );
-  const vertexCount = includedFacets.reduce((sum, facet) => sum + countVertices(facet.feature), 0);
-  const nearbyCount = facets.length - includedFacets.length;
-  const roleSummary = includedFacets.map((facet) => facet.role).join(", ");
-  const reasons = [
-    `${includedFacets.length} included structure${includedFacets.length === 1 ? "" : "s"}: ${roleSummary}.`,
-  ];
-
-  if (nearbyCount > 0) {
-    reasons.push(`${nearbyCount} nearby footprint${nearbyCount === 1 ? "" : "s"} excluded by default.`);
-  }
-
-  if (includedFootprintSqft < 900) {
-    reasons.push("Small footprint profile uses a lower pitch assumption and wider error band.");
-    return {
-      label: "Small low-complexity roof",
-      pitch: "4/12",
-      overhangInches: 10,
-      calibrationAdjustmentPercent: 2,
-      confidence: "Low",
-      expectedErrorPercent: nearbyCount > 0 ? 22 : 18,
-      reasons,
-    };
-  }
-
-  if (includedFootprintSqft > 3200 || vertexCount > 18 || includedFacets.length > 1) {
-    reasons.push("Large or irregular footprint profile uses steeper pitch and positive calibration.");
-    return {
-      label: "Large or complex roof",
-      pitch: "8/12",
-      overhangInches: 12,
-      calibrationAdjustmentPercent: 8,
-      confidence: nearbyCount > 2 ? "Low" : "Medium",
-      expectedErrorPercent: nearbyCount > 2 ? 24 : 18,
-      reasons,
-    };
-  }
-
-  reasons.push("Standard detached-home profile uses 6/12 pitch and modest calibration.");
-
-  return {
-    label: "Standard detached home",
-    pitch: "6/12",
-    overhangInches: 12,
-    calibrationAdjustmentPercent: 4,
-    confidence: nearbyCount > 2 ? "Medium" : "High",
-    expectedErrorPercent: nearbyCount > 2 ? 16 : 12,
-    reasons,
-  };
-}
-
-function applyCommunityProfile(facets: Facet[], profile: CommunityProfile) {
-  return facets.map((facet) => {
-    const isDetachedGarage = facet.role === "Detached garage candidate";
-    const isAttachedCandidate = facet.role === "Attached roof candidate";
-    const shouldInclude =
-      facet.role === "Main roof" ||
-      (isAttachedCandidate && profile.attachedGaragePolicy === "include") ||
-      (isDetachedGarage && profile.detachedGaragePolicy === "include") ||
-      (!isDetachedGarage && !isAttachedCandidate && facet.included);
-
-    return {
-      ...facet,
-      pitch: shouldInclude ? profile.defaultPitch : facet.pitch,
-      included: shouldInclude,
-      includeReason: isDetachedGarage
-        ? `Community garage policy is ${profile.detachedGaragePolicy}. Detached garage candidate ${
-            shouldInclude ? "included" : "excluded"
-          }.`
-        : isAttachedCandidate
-          ? `Community attached garage policy is ${profile.attachedGaragePolicy}. Attached roof candidate ${
-              shouldInclude ? "included" : "excluded"
-            }.`
-          : facet.includeReason,
-    };
-  });
-}
-
-function summarizeFacets({
-  facets,
-  overhangInches,
-  calibrationAdjustmentPercent,
-  wasteFactor,
-}: {
-  facets: Facet[];
-  overhangInches: number;
-  calibrationAdjustmentPercent: number;
-  wasteFactor: number;
-}) {
-  const includedFacets = facets.filter((facet) => facet.included);
-  const buildingFootprintSqft = includedFacets.reduce(
-    (sum, facet) => sum + turfArea(facet.feature) * SQM_TO_SQFT,
-    0,
-  );
-  const overhangFootprintSqft = includedFacets.reduce(
-    (sum, facet) => sum + turfArea(applyOverhang(facet.feature, overhangInches)) * SQM_TO_SQFT,
-    0,
-  );
-  const baseRoofSqft = includedFacets.reduce((sum, facet) => {
-    const footprintSqft = turfArea(applyOverhang(facet.feature, overhangInches)) * SQM_TO_SQFT;
-
-    return sum + footprintSqft * pitchMultiplierFor(facet.pitch);
-  }, 0);
-  const roofSqft = baseRoofSqft * (1 + calibrationAdjustmentPercent / 100);
-  const wasteAdjustedSqft = roofSqft * (1 + wasteFactor / 100);
-
-  return {
-    buildingFootprintSqft,
-    overhangFootprintSqft,
-    roofSqft,
-    roofingSquares: roofSqft / 100,
-    wasteAdjustedSqft,
-    includedStructures: includedFacets.length,
-    excludedStructures: facets.length - includedFacets.length,
-  };
-}
-
-function flagsForEstimate(facets: Facet[], profile: CommunityProfile, expectedErrorPercent: number) {
-  const flags: string[] = [];
-
-  if (facets.length > 1) {
-    flags.push("multiple structures found");
-  }
-
-  if (facets.some((facet) => facet.role === "Detached garage candidate" && !facet.included)) {
-    flags.push("detached garage excluded");
-  }
-
-  if (profile.defaultPitch !== DEFAULT_PITCH) {
-    flags.push("community pitch override applied");
-  }
-
-  if (expectedErrorPercent >= 18) {
-    flags.push("wide error range");
-  }
-
-  if (facets.some((facet) => facet.role === "Nearby structure")) {
-    flags.push("nearby structure excluded");
-  }
-
-  return flags.length > 0 ? flags : ["standard community assumptions"];
-}
-
-function recalculateBatchResult(
-  result: BatchResult,
-  facets: Facet[],
-  overrides: Partial<Pick<BatchResult, "overhangInches" | "calibrationAdjustmentPercent">> = {},
-): BatchResult {
-  const profile =
-    COMMUNITY_PROFILES.find((item) => item.community === result.community) ??
-    COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
-  const overhangInches = overrides.overhangInches ?? result.overhangInches;
-  const calibrationAdjustmentPercent =
-    overrides.calibrationAdjustmentPercent ?? result.calibrationAdjustmentPercent;
-  const summary = summarizeFacets({
-    facets,
-    overhangInches,
-    calibrationAdjustmentPercent,
-    wasteFactor: 0,
-  });
-  const expectedErrorPercent =
-    profile.expectedErrorPercent +
-    (summary.excludedStructures > 2 ? 4 : 0) +
-    (summary.includedStructures === 0 ? 50 : 0);
-
-  return {
-    ...result,
-    facets,
-    buildingFootprintSqft: summary.buildingFootprintSqft,
-    overhangFootprintSqft: summary.overhangFootprintSqft,
-    roofSqft: summary.roofSqft,
-    roofingSquares: summary.roofingSquares,
-    wasteAdjustedSqft: summary.wasteAdjustedSqft,
-    overhangInches,
-    calibrationAdjustmentPercent,
-    includedStructures: summary.includedStructures,
-    excludedStructures: summary.excludedStructures,
-    pitch: facets.find((facet) => facet.included)?.pitch ?? result.pitch,
-    pitchMultiplier: pitchMultiplierFor(facets.find((facet) => facet.included)?.pitch ?? result.pitch),
-    confidence: expectedErrorPercent > 20 ? "Low" : profile.confidence,
-    expectedErrorPercent,
-    flags: flagsForEstimate(facets, profile, expectedErrorPercent),
-    assumptions: [
-      profile.notes,
-      `Overrides now use ${facets.find((facet) => facet.included)?.pitch ?? result.pitch} pitch, ${overhangInches} inch overhang, ${calibrationAdjustmentPercent} percent calibration.`,
-      ...facets.map((facet) => `${facet.role}: ${facet.includeReason}`),
-    ],
   };
 }
 
@@ -578,12 +399,6 @@ function waitForMapIdle(map: mapboxgl.Map) {
 
     map.once("idle", () => resolve());
   });
-}
-
-function isRoofGeometry(
-  geometry: Geometry | null | undefined,
-): geometry is Polygon | MultiPolygon {
-  return geometry?.type === "Polygon" || geometry?.type === "MultiPolygon";
 }
 
 function findBuildingFootprints(
@@ -651,13 +466,10 @@ function findBuildingFootprints(
       return a.distanceFromAddressMeters - b.distanceFromAddressMeters;
     });
 
-  const bestCandidate = candidates[0];
-
-  if (!bestCandidate) {
+  if (!candidates[0]) {
     return {
       ok: false,
-      reason:
-        "No nearby building footprint was found. This address cannot be estimated automatically from the available map data.",
+      reason: "No nearby Mapbox building footprint was found for this Calgary parcel centroid.",
     };
   }
 
@@ -688,7 +500,7 @@ function findBuildingFootprints(
           distanceFromAddressMeters: candidate.distanceFromAddressMeters,
         },
       },
-      pitch: DEFAULT_PITCH,
+      pitch: DEFAULT_ASSUMPTIONS.pitch,
       included: classification.included,
       source: candidate.containsAddressPoint ? "address" : "nearby",
       role: classification.role,
@@ -701,9 +513,304 @@ function findBuildingFootprints(
     facets,
     source:
       facets.length === 1
-        ? "Auto footprint from building polygon at the address point."
-        : `Found ${facets.length} nearby building footprints. Closest structure is included by default.`,
+        ? "Mapbox building footprint found at the Calgary parcel centroid."
+        : `Found ${facets.length} nearby Mapbox building footprints. Closest structure is included by default.`,
   };
+}
+
+function summarizeFacets({
+  facets,
+  overhangInches,
+  calibrationPercent,
+  wasteFactor,
+}: {
+  facets: Facet[];
+  overhangInches: number;
+  calibrationPercent: number;
+  wasteFactor: number;
+}) {
+  const includedFacets = facets.filter((facet) => facet.included);
+  const buildingFootprintSqft = includedFacets.reduce(
+    (sum, facet) => sum + turfArea(facet.feature) * SQM_TO_SQFT,
+    0,
+  );
+  const overhangFootprintSqft = includedFacets.reduce(
+    (sum, facet) => sum + turfArea(applyOverhang(facet.feature, overhangInches)) * SQM_TO_SQFT,
+    0,
+  );
+  const roofSqft =
+    includedFacets.reduce((sum, facet) => {
+      const footprintSqft = turfArea(applyOverhang(facet.feature, overhangInches)) * SQM_TO_SQFT;
+      return sum + footprintSqft * pitchMultiplierFor(facet.pitch);
+    }, 0) *
+    (1 + calibrationPercent / 100);
+  const wasteAdjustedSqft = roofSqft * (1 + wasteFactor / 100);
+
+  return {
+    buildingFootprintSqft,
+    overhangFootprintSqft,
+    roofSqft,
+    roofingSquares: roofSqft / 100,
+    wasteAdjustedSqft,
+    includedStructures: includedFacets.length,
+    excludedStructures: facets.length - includedFacets.length,
+  };
+}
+
+function normalizeFacets(
+  baseFacets: Facet[],
+  assumptions: CommunityAssumptions,
+  override: HouseOverride | undefined,
+) {
+  const pitch = override?.pitch ?? assumptions.pitch;
+  const detachedGaragePolicy = override?.detachedGaragePolicy ?? assumptions.detachedGaragePolicy;
+  const attachedGaragePolicy = override?.attachedGaragePolicy ?? assumptions.attachedGaragePolicy;
+
+  return baseFacets.map((facet) => {
+    const facetOverride = override?.facetOverrides?.[facet.id];
+    const isDetached = facet.role === "Detached garage candidate";
+    const isAttached = facet.role === "Attached roof candidate";
+    const policyIncluded =
+      facet.role === "Main roof" ||
+      (isAttached && attachedGaragePolicy === "include") ||
+      (isDetached && detachedGaragePolicy === "include") ||
+      (!isAttached && !isDetached && facet.included);
+    const included = facetOverride?.included ?? policyIncluded;
+
+    return {
+      ...facet,
+      pitch: facetOverride?.pitch ?? pitch,
+      included,
+      includeReason:
+        facetOverride?.included !== undefined
+          ? included
+            ? "Included by house-level override."
+            : "Excluded by house-level override."
+          : isDetached
+            ? `Detached garage policy is ${detachedGaragePolicy}.`
+            : isAttached
+              ? `Attached garage policy is ${attachedGaragePolicy}.`
+              : facet.includeReason,
+    };
+  });
+}
+
+function buildFlags(
+  address: EligibleAddress,
+  facets: Facet[],
+  sourceMessage: string,
+  expectedErrorPercent: number,
+) {
+  const flags = [classificationLabel(address.subPropertyUse)];
+
+  if (address.dwellingType === "Duplex") {
+    flags.push("Duplex counted as one roof estimate");
+  }
+
+  if (facets.length > 1) {
+    flags.push("Multiple Mapbox building footprints found");
+  }
+
+  if (facets.some((facet) => facet.role === "Detached garage candidate" && !facet.included)) {
+    flags.push("Detached garage excluded");
+  }
+
+  if (facets.some((facet) => facet.role === "Nearby structure")) {
+    flags.push("Nearby structure excluded");
+  }
+
+  if (sourceMessage) {
+    flags.push(sourceMessage);
+  }
+
+  if (expectedErrorPercent >= 20) {
+    flags.push("Wide expected error band");
+  }
+
+  return flags;
+}
+
+function buildResult({
+  address,
+  baseFacets,
+  assumptions,
+  override,
+  sourceMessage,
+  status,
+}: {
+  address: EligibleAddress;
+  baseFacets: Facet[];
+  assumptions: CommunityAssumptions;
+  override?: HouseOverride;
+  sourceMessage: string;
+  status: EstimateStatus;
+}): BatchResult {
+  const facets = normalizeFacets(baseFacets, assumptions, override);
+  const overhangInches = override?.overhangInches ?? assumptions.overhangInches;
+  const calibrationPercent = override?.calibrationPercent ?? assumptions.calibrationPercent;
+  const wasteFactor = override?.wasteFactor ?? assumptions.wasteFactor;
+  const pitch = override?.pitch ?? assumptions.pitch;
+  const detachedGaragePolicy = override?.detachedGaragePolicy ?? assumptions.detachedGaragePolicy;
+  const attachedGaragePolicy = override?.attachedGaragePolicy ?? assumptions.attachedGaragePolicy;
+  const summary = summarizeFacets({
+    facets,
+    overhangInches,
+    calibrationPercent,
+    wasteFactor,
+  });
+  const baseError =
+    status === "Estimated"
+      ? address.dwellingType === "Duplex"
+        ? 18
+        : 14
+      : status === "Loaded" || status === "Estimating"
+        ? 0
+        : 100;
+  const expectedErrorPercent =
+    baseError +
+    (summary.excludedStructures > 2 ? 5 : 0) +
+    (address.ageBand === "Unknown" ? 3 : 0) +
+    (detachedGaragePolicy === "auto" ? 2 : 0);
+  const confidence =
+    override?.confidence ??
+    (status !== "Estimated"
+      ? "Unusable"
+      : expectedErrorPercent <= 15
+        ? "High"
+        : expectedErrorPercent <= 22
+          ? "Medium"
+          : "Low");
+  const assumptionsText = [
+    `Community defaults: ${assumptions.pitch} pitch, ${assumptions.overhangInches} inch overhang, ${assumptions.calibrationPercent} percent calibration, ${assumptions.wasteFactor} percent waste.`,
+    `Effective house assumptions: ${pitch} pitch, ${overhangInches} inch overhang, ${calibrationPercent} percent calibration, ${wasteFactor} percent waste.`,
+    `Attached garage policy ${attachedGaragePolicy}; detached garage policy ${detachedGaragePolicy}.`,
+  ];
+
+  if (override && Object.keys(override).length > 0) {
+    assumptionsText.push("House-level override saved in localStorage.");
+  }
+
+  if (override?.notes?.trim()) {
+    assumptionsText.push(`Notes: ${override.notes.trim()}`);
+  }
+
+  return {
+    id: address.id,
+    address,
+    baseFacets,
+    facets,
+    sourceMessage,
+    buildingFootprintSqft: summary.buildingFootprintSqft,
+    overhangFootprintSqft: summary.overhangFootprintSqft,
+    roofSqft: summary.roofSqft,
+    roofingSquares: summary.roofingSquares,
+    wasteAdjustedSqft: summary.wasteAdjustedSqft,
+    pitch,
+    overhangInches,
+    calibrationPercent,
+    wasteFactor,
+    detachedGaragePolicy,
+    attachedGaragePolicy,
+    confidence,
+    expectedErrorPercent,
+    flags: buildFlags(address, facets, sourceMessage, expectedErrorPercent),
+    assumptions: assumptionsText,
+    includedStructures: summary.includedStructures,
+    excludedStructures: summary.excludedStructures,
+    status,
+  };
+}
+
+function addressFromRow(
+  row: CalgaryAssessmentRow,
+  seenDuplexKeys: Set<string>,
+): EligibleAddress | null {
+  const dwellingType = dwellingTypeForCode(row.sub_property_use);
+
+  if (!dwellingType || row.assessment_class !== "RE") {
+    return null;
+  }
+
+  if (dwellingType === "Duplex") {
+    const duplexKey = row.cpid || JSON.stringify(row.multipolygon?.coordinates ?? row.address);
+
+    if (seenDuplexKeys.has(duplexKey)) {
+      return null;
+    }
+
+    seenDuplexKeys.add(duplexKey);
+  }
+
+  const constructionYear = parseYear(row.year_of_construction);
+  const parcel =
+    row.multipolygon?.type === "MultiPolygon"
+      ? ({
+          type: "Feature",
+          id: row.unique_key ?? row.address,
+          properties: {
+            id: row.unique_key ?? row.address ?? "",
+            address: row.address ?? "Unknown address",
+            community: row.comm_name ?? "",
+            dwellingType,
+            ageBand: ageBandFor(constructionYear),
+            constructionYear,
+            subPropertyUse: row.sub_property_use ?? "",
+          },
+          geometry: row.multipolygon,
+        } satisfies ParcelFeature)
+      : null;
+  const parcelCenter = parcel ? turfCenter(parcel) : null;
+  const coordinates = parcelCenter?.geometry.coordinates;
+  const id = row.unique_key || row.cpid || row.address || crypto.randomUUID();
+
+  return {
+    id,
+    address: row.address ?? "Unknown address",
+    community: row.comm_name ?? "",
+    dwellingType,
+    classificationSource: classificationLabel(row.sub_property_use),
+    constructionYear,
+    ageBand: ageBandFor(constructionYear),
+    landUse: row.land_use_designation ?? "",
+    propertyType: row.property_type ?? "",
+    assessmentClass: row.assessment_class ?? "",
+    assessmentClassDescription: row.assessment_class_description ?? "",
+    subPropertyUse: row.sub_property_use ?? "",
+    uniqueKey: row.unique_key ?? "",
+    cpid: row.cpid ?? "",
+    rollNumber: row.roll_number ?? "",
+    latitude: coordinates?.[1] ?? null,
+    longitude: coordinates?.[0] ?? null,
+    parcel,
+    sourceRow: row,
+  } satisfies EligibleAddress;
+}
+
+function sourceDataForParcels(addresses: EligibleAddress[]) {
+  return {
+    type: "FeatureCollection",
+    features: addresses.flatMap((address) => (address.parcel ? [address.parcel] : [])),
+  } satisfies FeatureCollection<MultiPolygon, ParcelProperties>;
+}
+
+function fitFeature(map: mapboxgl.Map, feature: Feature) {
+  const [minLng, minLat, maxLng, maxLat] = turfBbox(feature);
+
+  map.fitBounds(
+    [
+      [minLng, minLat],
+      [maxLng, maxLat],
+    ],
+    { padding: 72, maxZoom: 18, duration: 550 },
+  );
+}
+
+function setGeoJsonSource(map: mapboxgl.Map, sourceId: string, data: FeatureCollection) {
+  const source = map.getSource(sourceId);
+
+  if (source && "setData" in source) {
+    source.setData(data);
+  }
 }
 
 export default function RoofCalibrationTool() {
@@ -711,92 +818,169 @@ export default function RoofCalibrationTool() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markerRef = useRef<mapboxgl.Marker | null>(null);
-  const drawRef = useRef<MapboxDraw | null>(null);
-  const hasLoadedSavedMeasurementsRef = useRef(false);
-
-  const [address, setAddress] = useState("");
-  const [resolvedAddress, setResolvedAddress] = useState("");
-  const [latitude, setLatitude] = useState<number | null>(null);
-  const [longitude, setLongitude] = useState<number | null>(null);
-  const [facets, setFacets] = useState<Facet[]>([]);
-  const [existingToolSqft, setExistingToolSqft] = useState("");
-  const [existingToolIncludesWaste, setExistingToolIncludesWaste] = useState(false);
-  const [wasteFactor, setWasteFactor] = useState("0");
-  const [overhangInches, setOverhangInches] = useState("12");
-  const [calibrationAdjustmentPercent, setCalibrationAdjustmentPercent] = useState("0");
-  const [confidence, setConfidence] = useState<Confidence>("Medium");
-  const [notes, setNotes] = useState("");
-  const [savedMeasurements, setSavedMeasurements] = useState<SavedMeasurement[]>([]);
-  const [searchError, setSearchError] = useState("");
-  const [saveMessage, setSaveMessage] = useState("");
-  const [autoEstimateMessage, setAutoEstimateMessage] = useState("");
-  const [autoRoofProfile, setAutoRoofProfile] = useState<AutoRoofProfile | null>(null);
-  const [isSearching, setIsSearching] = useState(false);
-  const [selectedCommunity, setSelectedCommunity] = useState("Sandstone Valley");
-  const [batchAddresses, setBatchAddresses] = useState("");
+  const [mapReady, setMapReady] = useState(false);
+  const [communitySummaries, setCommunitySummaries] = useState<CommunitySummary[]>([]);
+  const [selectedCommunity, setSelectedCommunity] = useState("");
+  const [assumptions, setAssumptions] = useState<CommunityAssumptions>(DEFAULT_ASSUMPTIONS);
+  const [eligibleAddresses, setEligibleAddresses] = useState<EligibleAddress[]>([]);
   const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
-  const [selectedBatchResultId, setSelectedBatchResultId] = useState<string | null>(null);
+  const [selectedAddressId, setSelectedAddressId] = useState<string | null>(null);
+  const [overrides, setOverrides] = useState<Record<string, HouseOverride>>({});
+  const [communityMessage, setCommunityMessage] = useState("Loading Calgary community summaries...");
+  const [addressMessage, setAddressMessage] = useState("");
   const [batchMessage, setBatchMessage] = useState("");
+  const [isLoadingCommunities, setIsLoadingCommunities] = useState(true);
+  const [isLoadingAddresses, setIsLoadingAddresses] = useState(false);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
 
-  const syncFacetsFromDraw = useCallback(() => {
-    const draw = drawRef.current;
+  const selectedSummary =
+    communitySummaries.find((summary) => summary.community === selectedCommunity) ?? null;
+  const selectedResult =
+    batchResults.find((result) => result.id === selectedAddressId) ??
+    (selectedAddressId
+      ? null
+      : batchResults.find((result) => result.status === "Estimated") ?? batchResults[0] ?? null);
+  const selectedOverride = selectedResult ? overrides[selectedResult.id] ?? {} : {};
+  const estimatedCount = batchResults.filter((result) => result.status === "Estimated").length;
+  const noFootprintCount = batchResults.filter((result) => result.status === "No footprint").length;
 
-    if (!draw) {
-      return;
-    }
+  const totals = useMemo(() => {
+    const estimated = batchResults.filter((result) => result.status === "Estimated");
+    const roofSqft = estimated.reduce((sum, result) => sum + result.roofSqft, 0);
+    const squares = estimated.reduce((sum, result) => sum + result.roofingSquares, 0);
 
-    const collection = draw.getAll() as FeatureCollection<Polygon | MultiPolygon>;
+    return {
+      roofSqft,
+      squares,
+      averageRoofSqft: estimated.length ? roofSqft / estimated.length : 0,
+    };
+  }, [batchResults]);
 
-    setFacets((currentFacets) => {
-      const currentFacetById = new Map(currentFacets.map((facet) => [facet.id, facet]));
+  const fetchCommunitySummaries = useCallback(async () => {
+    setIsLoadingCommunities(true);
+    setCommunityMessage("Loading Calgary community summaries...");
 
-      return collection.features.map((feature, index) => {
-        const id = String(feature.id ?? `facet-${index + 1}`);
-        const currentFacet = currentFacetById.get(id);
-
-        return {
-          id,
-          feature: { ...feature, id } as RoofFeature,
-          pitch: currentFacet?.pitch ?? DEFAULT_PITCH,
-          included: currentFacet?.included ?? true,
-          source: currentFacet?.source ?? "nearby",
-          role: currentFacet?.role ?? "Nearby structure",
-          includeReason: currentFacet?.includeReason ?? "Map feature restored from drawing state.",
-        };
+    try {
+      const url = buildSocrataUrl({
+        $select: "comm_name,sub_property_use,year_of_construction,count(*) as count",
+        $where:
+          "assessment_class='RE' AND sub_property_use in('R110','R120') AND year_of_construction IS NOT NULL",
+        $group: "comm_name,sub_property_use,year_of_construction",
+        $limit: 50000,
       });
-    });
-  }, []);
+      const response = await fetch(url);
 
-  useEffect(() => {
-    const loadTimer = window.setTimeout(() => {
-      const stored = window.localStorage.getItem(STORAGE_KEY);
-
-      if (!stored) {
-        hasLoadedSavedMeasurementsRef.current = true;
-        return;
+      if (!response.ok) {
+        throw new Error(`Calgary data request failed with ${response.status}.`);
       }
 
-      try {
-        const parsed = JSON.parse(stored) as SavedMeasurement[];
-        setSavedMeasurements(Array.isArray(parsed) ? parsed : []);
-      } catch {
-        setSavedMeasurements([]);
-      } finally {
-        hasLoadedSavedMeasurementsRef.current = true;
-      }
-    }, 0);
+      const rows = (await response.json()) as GroupedSummaryRow[];
+      const summaries = new Map<string, CommunitySummary & { weightedYearTotal: number }>();
 
-    return () => window.clearTimeout(loadTimer);
-  }, []);
+      rows.forEach((row) => {
+        const community = row.comm_name?.trim();
+        const dwellingType = dwellingTypeForCode(row.sub_property_use);
+        const year = parseYear(row.year_of_construction);
+        const count = Number(row.count ?? 0);
 
-  useEffect(() => {
-    if (!hasLoadedSavedMeasurementsRef.current) {
-      return;
+        if (!community || !dwellingType || !Number.isFinite(count) || count <= 0) {
+          return;
+        }
+
+        const current =
+          summaries.get(community) ??
+          ({
+            community,
+            singleDetachedCount: 0,
+            duplexCount: 0,
+            total: 0,
+            averageYear: null,
+            oldestYear: null,
+            priorityScore: 0,
+            ageTypeBreakdown: createEmptyBreakdown(),
+            weightedYearTotal: 0,
+          } satisfies CommunitySummary & { weightedYearTotal: number });
+        const band = ageBandFor(year);
+
+        current.total += count;
+        current.weightedYearTotal += (year ?? 0) * count;
+        current.oldestYear =
+          year === null
+            ? current.oldestYear
+            : current.oldestYear === null
+              ? year
+              : Math.min(current.oldestYear, year);
+
+        if (dwellingType === "Single detached") {
+          current.singleDetachedCount += count;
+        } else {
+          current.duplexCount += count;
+        }
+
+        current.ageTypeBreakdown[band][dwellingType] += count;
+        summaries.set(community, current);
+      });
+
+      const processed = Array.from(summaries.values())
+        .map((summary) => {
+          const olderCount =
+            summary.ageTypeBreakdown["Pre-1950"]["Single detached"] +
+            summary.ageTypeBreakdown["Pre-1950"].Duplex +
+            summary.ageTypeBreakdown["1950-1969"]["Single detached"] +
+            summary.ageTypeBreakdown["1950-1969"].Duplex +
+            summary.ageTypeBreakdown["1970-1989"]["Single detached"] +
+            summary.ageTypeBreakdown["1970-1989"].Duplex;
+          const averageYear = summary.total ? summary.weightedYearTotal / summary.total : null;
+
+          return {
+            community: summary.community,
+            singleDetachedCount: summary.singleDetachedCount,
+            duplexCount: summary.duplexCount,
+            total: summary.total,
+            averageYear,
+            oldestYear: summary.oldestYear,
+            priorityScore: olderCount * 2 + summary.total * 0.2 - (averageYear ?? 2026),
+            ageTypeBreakdown: summary.ageTypeBreakdown,
+          } satisfies CommunitySummary;
+        })
+        .filter((summary) => summary.total >= 50)
+        .sort((a, b) => b.priorityScore - a.priorityScore);
+
+      setCommunitySummaries(processed);
+      setSelectedCommunity((current) => current || processed[0]?.community || "");
+      setCommunityMessage(
+        `Loaded ${processed.length} Calgary communities. Sorted by older construction stock and eligible detached/duplex count.`,
+      );
+    } catch (error) {
+      setCommunityMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to load Calgary community summaries from open data.",
+      );
+    } finally {
+      setIsLoadingCommunities(false);
     }
+  }, []);
 
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(savedMeasurements));
-  }, [savedMeasurements]);
+  useEffect(() => {
+    void fetchCommunitySummaries();
+  }, [fetchCommunitySummaries]);
+
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem(OVERRIDES_STORAGE_KEY);
+
+      if (stored) {
+        setOverrides(JSON.parse(stored) as Record<string, HouseOverride>);
+      }
+    } catch {
+      setOverrides({});
+    }
+  }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(OVERRIDES_STORAGE_KEY, JSON.stringify(overrides));
+  }, [overrides]);
 
   useEffect(() => {
     if (!mapboxToken || !mapContainerRef.current || mapRef.current) {
@@ -813,751 +997,514 @@ export default function RoofCalibrationTool() {
       attributionControl: false,
     });
 
-    const draw = new MapboxDraw({
-      defaultMode: "simple_select",
-      displayControlsDefault: false,
-      controls: {},
-    });
-
     map.addControl(new mapboxgl.NavigationControl({ visualizePitch: true }), "top-right");
     map.addControl(new mapboxgl.AttributionControl({ compact: true }), "bottom-right");
-    map.addControl(draw, "top-left");
+    mapRef.current = map;
 
     map.on("load", () => {
-      if (!map.getSource(BUILDING_SOURCE_ID)) {
-        map.addSource(BUILDING_SOURCE_ID, {
-          type: "vector",
-          url: "mapbox://mapbox.mapbox-streets-v8",
-        });
-      }
+      map.addSource(BUILDING_SOURCE_ID, {
+        type: "vector",
+        url: "mapbox://mapbox.mapbox-streets-v8",
+      });
+      map.addLayer({
+        id: BUILDING_FOOTPRINT_LAYER_ID,
+        type: "fill",
+        source: BUILDING_SOURCE_ID,
+        "source-layer": "building",
+        minzoom: 13,
+        paint: {
+          "fill-color": "#0ea5e9",
+          "fill-opacity": 0.16,
+          "fill-outline-color": "#0f172a",
+        },
+      });
 
-      if (!map.getLayer(BUILDING_FOOTPRINT_LAYER_ID)) {
-        map.addLayer({
-          id: BUILDING_FOOTPRINT_LAYER_ID,
-          type: "fill",
-          source: BUILDING_SOURCE_ID,
-          "source-layer": "building",
-          minzoom: 13,
-          paint: {
-            "fill-color": "#38bdf8",
-            "fill-opacity": 0.18,
-            "fill-outline-color": "#0f172a",
-          },
-        });
-      }
+      map.addSource(PARCEL_SOURCE_ID, {
+        type: "geojson",
+        data: EMPTY_FEATURE_COLLECTION,
+      });
+      map.addLayer({
+        id: PARCEL_FILL_LAYER_ID,
+        type: "fill",
+        source: PARCEL_SOURCE_ID,
+        paint: {
+          "fill-color": [
+            "match",
+            ["get", "ageBand"],
+            "Pre-1950",
+            "#991b1b",
+            "1950-1969",
+            "#dc2626",
+            "1970-1989",
+            "#f97316",
+            "1990-2009",
+            "#eab308",
+            "2010+",
+            "#22c55e",
+            "#64748b",
+          ],
+          "fill-opacity": [
+            "case",
+            ["==", ["get", "dwellingType"], "Duplex"],
+            0.34,
+            0.22,
+          ],
+        },
+      });
+      map.addLayer({
+        id: PARCEL_LINE_LAYER_ID,
+        type: "line",
+        source: PARCEL_SOURCE_ID,
+        paint: {
+          "line-color": [
+            "case",
+            ["==", ["get", "dwellingType"], "Duplex"],
+            "#1d4ed8",
+            "#334155",
+          ],
+          "line-width": [
+            "case",
+            ["==", ["get", "dwellingType"], "Duplex"],
+            1.8,
+            0.8,
+          ],
+          "line-opacity": 0.7,
+        },
+      });
+
+      map.addSource(SELECTED_PARCEL_SOURCE_ID, {
+        type: "geojson",
+        data: EMPTY_FEATURE_COLLECTION,
+      });
+      map.addLayer({
+        id: SELECTED_PARCEL_FILL_LAYER_ID,
+        type: "fill",
+        source: SELECTED_PARCEL_SOURCE_ID,
+        paint: {
+          "fill-color": "#38bdf8",
+          "fill-opacity": 0.24,
+        },
+      });
+      map.addLayer({
+        id: SELECTED_PARCEL_LINE_LAYER_ID,
+        type: "line",
+        source: SELECTED_PARCEL_SOURCE_ID,
+        paint: {
+          "line-color": "#0369a1",
+          "line-width": 3,
+        },
+      });
+
+      map.addSource(SELECTED_ROOF_SOURCE_ID, {
+        type: "geojson",
+        data: EMPTY_FEATURE_COLLECTION,
+      });
+      map.addLayer({
+        id: SELECTED_ROOF_FILL_LAYER_ID,
+        type: "fill",
+        source: SELECTED_ROOF_SOURCE_ID,
+        paint: {
+          "fill-color": [
+            "case",
+            ["==", ["get", "included"], true],
+            "#facc15",
+            "#94a3b8",
+          ],
+          "fill-opacity": [
+            "case",
+            ["==", ["get", "included"], true],
+            0.48,
+            0.18,
+          ],
+        },
+      });
+      map.addLayer({
+        id: SELECTED_ROOF_LINE_LAYER_ID,
+        type: "line",
+        source: SELECTED_ROOF_SOURCE_ID,
+        paint: {
+          "line-color": [
+            "case",
+            ["==", ["get", "included"], true],
+            "#a16207",
+            "#475569",
+          ],
+          "line-width": 2,
+        },
+      });
+
+      setMapReady(true);
     });
-
-    map.on("draw.create", syncFacetsFromDraw);
-    map.on("draw.update", syncFacetsFromDraw);
-    map.on("draw.delete", syncFacetsFromDraw);
-
-    mapRef.current = map;
-    drawRef.current = draw;
 
     return () => {
       markerRef.current?.remove();
       markerRef.current = null;
-      drawRef.current = null;
       mapRef.current = null;
+      setMapReady(false);
       map.remove();
     };
-  }, [mapboxToken, syncFacetsFromDraw]);
+  }, [mapboxToken]);
 
-  const calculatedFacets = useMemo<CalculatedFacet[]>(() => {
-    const parsedOverhang = Number(overhangInches);
-    const validOverhang =
-      Number.isFinite(parsedOverhang) && parsedOverhang >= 0 && parsedOverhang <= 36
-        ? parsedOverhang
-        : 0;
+  useEffect(() => {
+    const map = mapRef.current;
 
-    return facets.map((facet) => {
-      const buildingFootprintSqft = turfArea(facet.feature) * SQM_TO_SQFT;
-      const overhangFeature = applyOverhang(facet.feature, validOverhang);
-      const footprintSqft = turfArea(overhangFeature) * SQM_TO_SQFT;
-      const pitchMultiplier = pitchMultiplierFor(facet.pitch);
-      const distanceFromAddressMeters =
-        typeof facet.feature.properties?.distanceFromAddressMeters === "number"
-          ? facet.feature.properties.distanceFromAddressMeters
-          : null;
+    if (!map || !mapReady) {
+      return;
+    }
 
-      return {
-        ...facet,
-        buildingFootprintSqft,
-        footprintSqft,
-        pitchMultiplier,
-        roofSurfaceSqft: footprintSqft * pitchMultiplier,
-        distanceFromAddressMeters,
-      };
+    const data = sourceDataForParcels(eligibleAddresses);
+    setGeoJsonSource(map, PARCEL_SOURCE_ID, data);
+
+    if (data.features[0]) {
+      fitFeature(map, data.features[0]);
+    }
+  }, [eligibleAddresses, mapReady]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+
+    if (!map || !mapReady || !selectedResult) {
+      return;
+    }
+
+    setGeoJsonSource(
+      map,
+      SELECTED_PARCEL_SOURCE_ID,
+      selectedResult.address.parcel
+        ? {
+            type: "FeatureCollection",
+            features: [selectedResult.address.parcel],
+          }
+        : EMPTY_FEATURE_COLLECTION,
+    );
+    setGeoJsonSource(map, SELECTED_ROOF_SOURCE_ID, {
+      type: "FeatureCollection",
+      features: selectedResult.facets.map((facet) => ({
+        ...facet.feature,
+        properties: {
+          ...(facet.feature.properties ?? {}),
+          role: facet.role,
+          included: facet.included,
+        },
+      })),
     });
-  }, [facets, overhangInches]);
 
-  const totals = useMemo(() => {
-    const includedFacets = calculatedFacets.filter((facet) => facet.included);
-    const totalBuildingFootprintSqft = includedFacets.reduce(
-      (sum, facet) => sum + facet.buildingFootprintSqft,
-      0,
-    );
-    const totalFootprintSqft = includedFacets.reduce(
-      (sum, facet) => sum + facet.footprintSqft,
-      0,
-    );
-    const baseRoofSurfaceSqft = includedFacets.reduce(
-      (sum, facet) => sum + facet.roofSurfaceSqft,
-      0,
-    );
-    const parsedWaste = Number(wasteFactor);
-    const validWasteFactor =
-      Number.isFinite(parsedWaste) && parsedWaste >= 0 && parsedWaste <= 30
-        ? parsedWaste
-        : 0;
-    const parsedCalibrationAdjustment = Number(calibrationAdjustmentPercent);
-    const validCalibrationAdjustmentPercent =
-      Number.isFinite(parsedCalibrationAdjustment) &&
-      parsedCalibrationAdjustment >= -30 &&
-      parsedCalibrationAdjustment <= 30
-        ? parsedCalibrationAdjustment
-        : 0;
-    const totalRoofSurfaceSqft =
-      baseRoofSurfaceSqft * (1 + validCalibrationAdjustmentPercent / 100);
-    const wasteAdjustedSqft = totalRoofSurfaceSqft * (1 + validWasteFactor / 100);
-
-    return {
-      totalBuildingFootprintSqft,
-      totalFootprintSqft,
-      baseRoofSurfaceSqft,
-      totalRoofSurfaceSqft,
-      roofingSquares: totalRoofSurfaceSqft / 100,
-      validWasteFactor,
-      validCalibrationAdjustmentPercent,
-      wasteAdjustedSqft,
-      wasteAdjustedRoofingSquares: wasteAdjustedSqft / 100,
-    };
-  }, [calculatedFacets, calibrationAdjustmentPercent, wasteFactor]);
-
-  const comparison = useMemo(() => {
-    const existing = parseOptionalPositive(existingToolSqft);
-
-    if (existing === null || Number.isNaN(existing)) {
-      return null;
+    if (selectedResult.address.longitude !== null && selectedResult.address.latitude !== null) {
+      markerRef.current?.remove();
+      markerRef.current = new mapboxgl.Marker({ color: "#facc15" })
+        .setLngLat([selectedResult.address.longitude, selectedResult.address.latitude])
+        .addTo(map);
+      map.flyTo({
+        center: [selectedResult.address.longitude, selectedResult.address.latitude],
+        zoom: Math.max(map.getZoom(), 17),
+        duration: 600,
+      });
     }
+  }, [selectedResult, mapReady]);
 
-    const differenceSqft = totals.totalRoofSurfaceSqft - existing;
-    const differencePercent = (differenceSqft / existing) * 100;
+  useEffect(() => {
+    setBatchResults((current) =>
+      current.map((result) =>
+        buildResult({
+          address: result.address,
+          baseFacets: result.baseFacets,
+          assumptions,
+          override: overrides[result.id],
+          sourceMessage: result.sourceMessage,
+          status: result.status,
+        }),
+      ),
+    );
+  }, [assumptions, overrides]);
 
-    return {
-      existing,
-      differenceSqft,
-      differencePercent,
-      status: statusForDifference(differencePercent),
-    };
-  }, [existingToolSqft, totals.totalRoofSurfaceSqft]);
-
-  const handleAddressSearch = async () => {
-    setSearchError("");
-    setSaveMessage("");
-    setAutoEstimateMessage("");
-    setAutoRoofProfile(null);
-
-    if (!address.trim()) {
-      setSearchError("Address is required before map search.");
+  const loadEligibleAddresses = async () => {
+    if (!selectedCommunity) {
       return;
     }
 
-    if (!mapboxToken) {
-      setSearchError("NEXT_PUBLIC_MAPBOX_TOKEN is missing. Add it to .env.local and restart.");
-      return;
-    }
-
-    setIsSearching(true);
+    setIsLoadingAddresses(true);
+    setAddressMessage("Loading eligible Calgary assessment rows...");
+    setBatchMessage("");
+    setSelectedAddressId(null);
 
     try {
-      const response = await fetch(
-        `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(
-          address.trim(),
-        )}.json?access_token=${mapboxToken}&limit=1&types=address`,
-      );
+      const where = [
+        `comm_name='${escapeSoqlLiteral(selectedCommunity)}'`,
+        "assessment_class='RE'",
+        assumptions.includeDuplexes
+          ? "sub_property_use in('R110','R120')"
+          : "sub_property_use='R110'",
+      ].join(" AND ");
+      const url = buildSocrataUrl({
+        $select:
+          "address,comm_name,year_of_construction,land_use_designation,property_type,sub_property_use,assessment_class,assessment_class_description,multipolygon,unique_key,cpid,roll_number",
+        $where: where,
+        $order: "address",
+        $limit: 5000,
+      });
+      const response = await fetch(url);
 
       if (!response.ok) {
-        throw new Error("Mapbox geocoding failed.");
+        throw new Error(`Calgary address request failed with ${response.status}.`);
       }
 
-      const data = (await response.json()) as {
-        features?: Array<{ center: [number, number]; place_name?: string }>;
-      };
-      const result = data.features?.[0];
+      const rows = (await response.json()) as CalgaryAssessmentRow[];
+      const seenDuplexKeys = new Set<string>();
+      const addresses = rows
+        .map((row) => addressFromRow(row, seenDuplexKeys))
+        .filter((address): address is EligibleAddress => address !== null);
 
-      if (!result) {
-        setSearchError("No address match found. Check the address and search again.");
-        return;
-      }
-
-      const [lng, lat] = result.center;
-      setLongitude(lng);
-      setLatitude(lat);
-      setResolvedAddress(result.place_name ?? address.trim());
-
-      const map = mapRef.current;
-
-      if (map) {
-        map.flyTo({ center: [lng, lat], zoom: 19.5, essential: true });
-        markerRef.current?.remove();
-        markerRef.current = new mapboxgl.Marker({ color: "#2563eb" })
-          .setLngLat([lng, lat])
-          .addTo(map);
-        await waitForMapIdle(map);
-
-        const autoEstimate = findBuildingFootprints(map, [lng, lat]);
-
-        if (autoEstimate.ok) {
-          const profile = deriveRoofProfile(autoEstimate.facets);
-          const profiledFacets = profile
-            ? autoEstimate.facets.map((facet) => ({
-                ...facet,
-                pitch: facet.included ? profile.pitch : facet.pitch,
-              }))
-            : autoEstimate.facets;
-
-          drawRef.current?.deleteAll();
-          profiledFacets.forEach((facet) => drawRef.current?.add(facet.feature));
-          setFacets(profiledFacets);
-          if (profile) {
-            setOverhangInches(String(profile.overhangInches));
-            setCalibrationAdjustmentPercent(String(profile.calibrationAdjustmentPercent));
-            setConfidence(profile.confidence);
-            setAutoRoofProfile(profile);
-          } else {
-            setConfidence("Medium");
-          }
-          setAutoEstimateMessage(autoEstimate.source);
-        } else {
-          drawRef.current?.deleteAll();
-          setFacets([]);
-          setConfidence("Unusable");
-          setAutoRoofProfile(null);
-          setAutoEstimateMessage(autoEstimate.reason);
-        }
-      }
-    } catch {
-      setSearchError("Search failed. Confirm the Mapbox token and try again.");
+      setEligibleAddresses(addresses);
+      setBatchResults(
+        addresses.map((address) =>
+          buildResult({
+            address,
+            baseFacets: [],
+            assumptions,
+            override: overrides[address.id],
+            sourceMessage: "Loaded from Calgary assessment data. Estimate has not been run.",
+            status: "Loaded",
+          }),
+        ),
+      );
+      setSelectedAddressId(addresses[0]?.id ?? null);
+      setAddressMessage(
+        `Loaded ${addresses.length} eligible addresses from Calgary open data. Filtered to residential R110 single detached${assumptions.includeDuplexes ? " and R120 duplex" : ""} rows only.`,
+      );
+    } catch (error) {
+      setAddressMessage(
+        error instanceof Error
+          ? error.message
+          : "Unable to load eligible Calgary addresses.",
+      );
     } finally {
-      setIsSearching(false);
+      setIsLoadingAddresses(false);
     }
   };
 
   const runBatchEstimate = async () => {
-    const profile =
-      COMMUNITY_PROFILES.find((item) => item.community === selectedCommunity) ??
-      COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
-    const addresses = batchAddresses
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .slice(0, 250);
     const map = mapRef.current;
 
-    setBatchMessage("");
-    setBatchResults([]);
-    setSelectedBatchResultId(null);
-
-    if (addresses.length === 0) {
-      setBatchMessage("Paste at least one address, one per line.");
-      return;
-    }
-
-    if (!mapboxToken || !map) {
+    if (!map || !mapReady || !mapboxToken) {
       setBatchMessage("Mapbox must be loaded before batch estimates can run.");
       return;
     }
 
+    const addresses = eligibleAddresses.length > 0 ? eligibleAddresses : [];
+
+    if (addresses.length === 0) {
+      setBatchMessage("Load eligible addresses first.");
+      return;
+    }
+
     setIsBatchRunning(true);
+    setBatchMessage(`Starting ${addresses.length} Mapbox/Turf estimates...`);
 
-    const results: BatchResult[] = [];
+    for (const [index, address] of addresses.entries()) {
+      setSelectedAddressId(address.id);
+      setBatchResults((current) =>
+        current.map((result) =>
+          result.id === address.id
+            ? buildResult({
+                address,
+                baseFacets: result.baseFacets,
+                assumptions,
+                override: overrides[address.id],
+                sourceMessage: "Estimating against Mapbox building footprints.",
+                status: "Estimating",
+              })
+            : result,
+        ),
+      );
 
-    for (const [index, batchAddress] of addresses.entries()) {
-      setBatchMessage(`Estimating ${index + 1} of ${addresses.length}`);
+      if (address.longitude === null || address.latitude === null) {
+        setBatchResults((current) =>
+          current.map((result) =>
+            result.id === address.id
+              ? buildResult({
+                  address,
+                  baseFacets: [],
+                  assumptions,
+                  override: overrides[address.id],
+                  sourceMessage: "Calgary parcel geometry was missing, so no centroid was available.",
+                  status: "No footprint",
+                })
+              : result,
+          ),
+        );
+        continue;
+      }
 
       try {
-        const response = await fetch(
-          `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(
-            batchAddress,
-          )}.json?access_token=${mapboxToken}&limit=1&types=address&proximity=-114.0719,51.0447`,
-        );
-
-        if (!response.ok) {
-          throw new Error("Mapbox geocoding failed.");
-        }
-
-        const data = (await response.json()) as {
-          features?: Array<{ center: [number, number]; place_name?: string }>;
-        };
-        const result = data.features?.[0];
-
-        if (!result) {
-          results.push({
-            id: crypto.randomUUID(),
-            address: batchAddress,
-            resolvedAddress: "",
-            community: profile.community,
-            latitude: null,
-            longitude: null,
-            buildingFootprintSqft: 0,
-            overhangFootprintSqft: 0,
-            roofSqft: 0,
-            roofingSquares: 0,
-            wasteAdjustedSqft: 0,
-            pitch: profile.defaultPitch,
-            pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
-            overhangInches: profile.defaultOverhangInches,
-            calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
-            buildEra: profile.buildEra,
-            houseType: profile.dominantHouseType,
-            garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
-            includedStructures: 0,
-            excludedStructures: 0,
-            confidence: "Unusable",
-            expectedErrorPercent: 100,
-            flags: ["geocode failed"],
-            assumptions: [profile.notes],
-            facets: [],
-            status: "Error",
-          });
-          setBatchResults([...results]);
-          continue;
-        }
-
-        const [lng, lat] = result.center;
-        map.flyTo({ center: [lng, lat], zoom: 19.5, essential: true });
+        map.jumpTo({
+          center: [address.longitude, address.latitude],
+          zoom: 18,
+        });
         await waitForMapIdle(map);
+        await new Promise((resolve) => window.setTimeout(resolve, 120));
 
-        const estimate = findBuildingFootprints(map, [lng, lat]);
+        const estimate = findBuildingFootprints(map, [address.longitude, address.latitude]);
 
-        if (!estimate.ok) {
-          results.push({
-            id: crypto.randomUUID(),
-            address: batchAddress,
-            resolvedAddress: result.place_name ?? batchAddress,
-            community: profile.community,
-            latitude: lat,
-            longitude: lng,
-            buildingFootprintSqft: 0,
-            overhangFootprintSqft: 0,
-            roofSqft: 0,
-            roofingSquares: 0,
-            wasteAdjustedSqft: 0,
-            pitch: profile.defaultPitch,
-            pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
-            overhangInches: profile.defaultOverhangInches,
-            calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
-            buildEra: profile.buildEra,
-            houseType: profile.dominantHouseType,
-            garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
-            includedStructures: 0,
-            excludedStructures: 0,
-            confidence: "Unusable",
-            expectedErrorPercent: 100,
-            flags: ["no building footprint"],
-            assumptions: [estimate.reason, profile.notes],
-            facets: [],
-            status: "No footprint",
-          });
-          setBatchResults([...results]);
-          continue;
-        }
-
-        const profiledFacets = applyCommunityProfile(estimate.facets, profile);
-        const summary = summarizeFacets({
-          facets: profiledFacets,
-          overhangInches: profile.defaultOverhangInches,
-          calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
-          wasteFactor: Number(wasteFactor) || 0,
-        });
-        const expectedErrorPercent =
-          profile.expectedErrorPercent +
-          (summary.excludedStructures > 2 ? 4 : 0) +
-          (summary.includedStructures === 0 ? 50 : 0);
-        const flags = flagsForEstimate(profiledFacets, profile, expectedErrorPercent);
-
-        results.push({
-          id: crypto.randomUUID(),
-          address: batchAddress,
-          resolvedAddress: result.place_name ?? batchAddress,
-          community: profile.community,
-          latitude: lat,
-          longitude: lng,
-          buildingFootprintSqft: summary.buildingFootprintSqft,
-          overhangFootprintSqft: summary.overhangFootprintSqft,
-          roofSqft: summary.roofSqft,
-          roofingSquares: summary.roofingSquares,
-          wasteAdjustedSqft: summary.wasteAdjustedSqft,
-          pitch: profile.defaultPitch,
-          pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
-          overhangInches: profile.defaultOverhangInches,
-          calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
-          buildEra: profile.buildEra,
-          houseType: profile.dominantHouseType,
-          garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
-          includedStructures: summary.includedStructures,
-          excludedStructures: summary.excludedStructures,
-          confidence: expectedErrorPercent > 20 ? "Low" : profile.confidence,
-          expectedErrorPercent,
-          flags,
-          assumptions: [
-            profile.notes,
-            `Community profile used ${profile.defaultPitch} pitch, ${profile.defaultOverhangInches} inch overhang, ${profile.calibrationAdjustmentPercent} percent calibration.`,
-            ...profiledFacets.map((facet) => `${facet.role}: ${facet.includeReason}`),
-          ],
-          facets: profiledFacets,
-          status: "Estimated",
-        });
-        setBatchResults([...results]);
-      } catch {
-        results.push({
-          id: crypto.randomUUID(),
-          address: batchAddress,
-          resolvedAddress: "",
-          community: profile.community,
-          latitude: null,
-          longitude: null,
-          buildingFootprintSqft: 0,
-          overhangFootprintSqft: 0,
-          roofSqft: 0,
-          roofingSquares: 0,
-          wasteAdjustedSqft: 0,
-          pitch: profile.defaultPitch,
-          pitchMultiplier: pitchMultiplierFor(profile.defaultPitch),
-          overhangInches: profile.defaultOverhangInches,
-          calibrationAdjustmentPercent: profile.calibrationAdjustmentPercent,
-          buildEra: profile.buildEra,
-          houseType: profile.dominantHouseType,
-          garagePolicy: `detached ${profile.detachedGaragePolicy}, attached ${profile.attachedGaragePolicy}`,
-          includedStructures: 0,
-          excludedStructures: 0,
-          confidence: "Unusable",
-          expectedErrorPercent: 100,
-          flags: ["estimate failed"],
-          assumptions: [profile.notes],
-          facets: [],
-          status: "Error",
-        });
-        setBatchResults([...results]);
+        setBatchResults((current) =>
+          current.map((result) =>
+            result.id === address.id
+              ? buildResult({
+                  address,
+                  baseFacets: estimate.ok ? estimate.facets : [],
+                  assumptions,
+                  override: overrides[address.id],
+                  sourceMessage: estimate.ok ? estimate.source : estimate.reason,
+                  status: estimate.ok ? "Estimated" : "No footprint",
+                })
+              : result,
+          ),
+        );
+      } catch (error) {
+        setBatchResults((current) =>
+          current.map((result) =>
+            result.id === address.id
+              ? buildResult({
+                  address,
+                  baseFacets: [],
+                  assumptions,
+                  override: overrides[address.id],
+                  sourceMessage:
+                    error instanceof Error ? error.message : "Unexpected estimation error.",
+                  status: "Error",
+                })
+              : result,
+          ),
+        );
       }
+
+      setBatchMessage(`Estimated ${index + 1} of ${addresses.length} addresses.`);
     }
 
-    setBatchMessage(`Finished ${results.length} estimate${results.length === 1 ? "" : "s"}.`);
     setIsBatchRunning(false);
+    setBatchMessage(`Finished ${addresses.length} addresses.`);
   };
 
-  const updateFacetPitch = (id: string, pitch: PitchValue) => {
-    setFacets((currentFacets) =>
-      currentFacets.map((facet) => (facet.id === id ? { ...facet, pitch } : facet)),
-    );
-    setSaveMessage("");
-  };
-
-  const updateFacetIncluded = (id: string, included: boolean) => {
-    setFacets((currentFacets) =>
-      currentFacets.map((facet) => (facet.id === id ? { ...facet, included } : facet)),
-    );
-    setSaveMessage("");
-  };
-
-  const updateBatchResult = (id: string, updater: (result: BatchResult) => BatchResult) => {
-    setBatchResults((currentResults) =>
-      currentResults.map((result) => (result.id === id ? updater(result) : result)),
-    );
-  };
-
-  const updateBatchAllIncludedPitch = (id: string, pitch: PitchValue) => {
-    updateBatchResult(id, (result) =>
-      recalculateBatchResult(
-        result,
-        result.facets.map((facet) => (facet.included ? { ...facet, pitch } : facet)),
-      ),
-    );
-  };
-
-  const updateBatchFacet = (id: string, facetId: string, patch: Partial<Facet>) => {
-    updateBatchResult(id, (result) =>
-      recalculateBatchResult(
-        result,
-        result.facets.map((facet) => (facet.id === facetId ? { ...facet, ...patch } : facet)),
-      ),
-    );
-  };
-
-  const updateBatchNumericOverride = (
-    id: string,
-    key: "overhangInches" | "calibrationAdjustmentPercent",
-    value: string,
+  const updateAssumptions = <Key extends keyof CommunityAssumptions>(
+    key: Key,
+    value: CommunityAssumptions[Key],
   ) => {
-    const numericValue = Number(value);
-
-    if (!Number.isFinite(numericValue)) {
-      return;
-    }
-
-    updateBatchResult(id, (result) => recalculateBatchResult(result, result.facets, { [key]: numericValue }));
+    setAssumptions((current) => ({ ...current, [key]: value }));
   };
 
-  const deleteFacet = (id: string) => {
-    drawRef.current?.delete(id);
-    setFacets((currentFacets) => currentFacets.filter((facet) => facet.id !== id));
-    setSaveMessage("");
+  const updateOverride = (id: string, patch: HouseOverride) => {
+    setOverrides((current) => ({
+      ...current,
+      [id]: {
+        ...(current[id] ?? {}),
+        ...patch,
+        facetOverrides: {
+          ...(current[id]?.facetOverrides ?? {}),
+          ...(patch.facetOverrides ?? {}),
+        },
+      },
+    }));
   };
 
-  const validateMeasurement = () => {
-    if (!address.trim() && !resolvedAddress) {
-      return "Address is required before saving.";
-    }
-
-    if (latitude === null || longitude === null) {
-      return "Search and center the property before saving.";
-    }
-
-    if (calculatedFacets.length === 0 || !calculatedFacets.some((facet) => facet.included)) {
-      return "At least one automatic roof footprint must be included before saving.";
-    }
-
-    const existing = parseOptionalPositive(existingToolSqft);
-
-    if (Number.isNaN(existing)) {
-      return "Existing tool sqft must be a positive number if entered.";
-    }
-
-    const waste = Number(wasteFactor);
-
-    if (!Number.isFinite(waste) || waste < 0 || waste > 30) {
-      return "Waste factor must be between 0 and 30 percent.";
-    }
-
-    const overhang = Number(overhangInches);
-
-    if (!Number.isFinite(overhang) || overhang < 0 || overhang > 36) {
-      return "Overhang must be between 0 and 36 inches.";
-    }
-
-    const calibration = Number(calibrationAdjustmentPercent);
-
-    if (!Number.isFinite(calibration) || calibration < -30 || calibration > 30) {
-      return "Calibration adjustment must be between -30 and 30 percent.";
-    }
-
-    return "";
-  };
-
-  const saveMeasurement = () => {
-    const validationError = validateMeasurement();
-
-    if (validationError) {
-      setSaveMessage(validationError);
-      return;
-    }
-
-    const existing = parseOptionalPositive(existingToolSqft);
-    const savedComparison =
-      existing !== null && !Number.isNaN(existing)
-        ? {
-            differenceSqft: totals.totalRoofSurfaceSqft - existing,
-            differencePercent: ((totals.totalRoofSurfaceSqft - existing) / existing) * 100,
-          }
-        : null;
-
-    const measurement: SavedMeasurement = {
-      id: crypto.randomUUID(),
-      address: resolvedAddress || address.trim(),
-      latitude: latitude ?? 0,
-      longitude: longitude ?? 0,
-      facets: calculatedFacets.map((facet) => ({
-        id: facet.id,
-        feature: facet.feature,
-        pitch: facet.pitch,
-        included: facet.included,
-        source: facet.source,
-        role: facet.role,
-        includeReason: facet.includeReason,
-        buildingFootprintSqft: facet.buildingFootprintSqft,
-        footprintSqft: facet.footprintSqft,
-        roofSurfaceSqft: facet.roofSurfaceSqft,
-      })),
-      totalFootprintSqft: totals.totalFootprintSqft,
-      totalRoofSurfaceSqft: totals.totalRoofSurfaceSqft,
-      wasteFactor: Number(wasteFactor),
-      overhangInches: Number(overhangInches),
-      calibrationAdjustmentPercent: Number(calibrationAdjustmentPercent),
-      wasteAdjustedSqft: totals.wasteAdjustedSqft,
-      roofingSquares: totals.roofingSquares,
-      existingToolSqft: existing,
-      existingToolIncludesWaste,
-      differenceSqft: savedComparison?.differenceSqft ?? null,
-      differencePercent: savedComparison?.differencePercent ?? null,
-      status: savedComparison
-        ? statusForDifference(savedComparison.differencePercent)
-        : null,
-      confidence,
-      notes,
-      createdAt: new Date().toISOString(),
-    };
-
-    setSavedMeasurements((currentMeasurements) => [measurement, ...currentMeasurements]);
-    setSaveMessage("Measurement saved.");
-  };
-
-  const viewMeasurement = (measurement: SavedMeasurement) => {
-    setAddress(measurement.address);
-    setResolvedAddress(measurement.address);
-    setLatitude(measurement.latitude);
-    setLongitude(measurement.longitude);
-    setExistingToolSqft(measurement.existingToolSqft ? String(measurement.existingToolSqft) : "");
-    setExistingToolIncludesWaste(measurement.existingToolIncludesWaste);
-    setWasteFactor(String(measurement.wasteFactor));
-    setOverhangInches(String(measurement.overhangInches ?? 12));
-    setCalibrationAdjustmentPercent(String(measurement.calibrationAdjustmentPercent ?? 0));
-    setConfidence(measurement.confidence);
-    setNotes(measurement.notes);
-
-    if (drawRef.current) {
-      drawRef.current.deleteAll();
-      measurement.facets.forEach((facet) => drawRef.current?.add(facet.feature));
-    }
-
-    setFacets(
-      measurement.facets.map((facet) => ({
-        id: facet.id,
-        feature: facet.feature,
-        pitch: facet.pitch,
-        included: facet.included ?? true,
-        source: facet.source ?? "saved",
-        role: facet.role ?? "Nearby structure",
-        includeReason: facet.includeReason ?? "Loaded from a saved measurement.",
-      })),
-    );
-    setAutoRoofProfile(null);
-    setSaveMessage("Loaded saved measurement.");
-
-    if (mapRef.current) {
-      mapRef.current.flyTo({
-        center: [measurement.longitude, measurement.latitude],
-        zoom: 19.5,
-        essential: true,
-      });
-      markerRef.current?.remove();
-      markerRef.current = new mapboxgl.Marker({ color: "#2563eb" })
-        .setLngLat([measurement.longitude, measurement.latitude])
-        .addTo(mapRef.current);
-    }
-
-    window.scrollTo({ top: 0, behavior: "smooth" });
-  };
-
-  const deleteMeasurement = (id: string) => {
-    setSavedMeasurements((currentMeasurements) =>
-      currentMeasurements.filter((measurement) => measurement.id !== id),
-    );
-  };
-
-  const exportCsv = () => {
-    const headers = [
-      "Address",
-      "Latitude",
-      "Longitude",
-      "Our sqft",
-      "Existing tool sqft",
-      "Difference percent",
-      "Status",
-      "Confidence",
-      "Overhang inches",
-      "Calibration adjustment percent",
-      "Waste factor",
-      "Waste adjusted sqft",
-      "Roofing squares",
-      "Created date",
-      "Notes",
-    ];
-    const rows = savedMeasurements.map((measurement) => [
-      measurement.address,
-      measurement.latitude,
-      measurement.longitude,
-      Math.round(measurement.totalRoofSurfaceSqft),
-      measurement.existingToolSqft ?? "",
-      measurement.differencePercent === null
-        ? ""
-        : measurement.differencePercent.toFixed(1),
-      measurement.status ?? "",
-      measurement.confidence,
-      measurement.overhangInches ?? 12,
-      measurement.calibrationAdjustmentPercent ?? 0,
-      measurement.wasteFactor,
-      Math.round(measurement.wasteAdjustedSqft),
-      measurement.roofingSquares.toFixed(1),
-      new Date(measurement.createdAt).toLocaleString(),
-      measurement.notes,
-    ]);
-    const csv = [headers, ...rows]
-      .map((row) => row.map((cell) => csvEscape(cell)).join(","))
-      .join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-
-    link.href = url;
-    link.download = "roof-sqft-calibration-measurements.csv";
-    link.click();
-    URL.revokeObjectURL(url);
+  const updateFacetOverride = (
+    result: BatchResult,
+    facetId: string,
+    patch: { included?: boolean; pitch?: PitchValue },
+  ) => {
+    updateOverride(result.id, {
+      facetOverrides: {
+        [facetId]: {
+          ...(overrides[result.id]?.facetOverrides?.[facetId] ?? {}),
+          ...patch,
+        },
+      },
+    });
   };
 
   const exportBatchCsv = () => {
     const headers = [
-      "Address",
-      "Resolved address",
+      "Source",
       "Community",
+      "Address",
+      "Unique key",
+      "CPID",
+      "Roll number",
+      "Dwelling type",
+      "Classification source",
+      "Construction year",
+      "Age band",
+      "Land use",
+      "Property type",
+      "Assessment class",
+      "Assessment class description",
+      "Sub property use",
       "Latitude",
       "Longitude",
+      "Default pitch",
+      "Effective pitch",
+      "Overhang inches",
+      "Calibration percent",
+      "Detached garage policy",
+      "Attached garage policy",
+      "Waste factor",
+      "Override notes",
+      "Override JSON",
       "Building footprint sqft",
       "Overhang footprint sqft",
       "Roof sqft",
       "Roofing squares",
       "Waste adjusted sqft",
-      "Pitch",
-      "Pitch multiplier",
-      "Overhang inches",
-      "Calibration percent",
-      "Build era",
-      "House type",
-      "Garage policy",
-      "Included structures",
-      "Excluded structures",
       "Confidence",
       "Expected error percent",
+      "Included structures",
+      "Excluded structures",
       "Flags",
       "Assumptions",
       "Status",
     ];
-    const rows = batchResults.map((result) => [
-      result.address,
-      result.resolvedAddress,
-      result.community,
-      result.latitude ?? "",
-      result.longitude ?? "",
-      Math.round(result.buildingFootprintSqft),
-      Math.round(result.overhangFootprintSqft),
-      Math.round(result.roofSqft),
-      result.roofingSquares.toFixed(1),
-      Math.round(result.wasteAdjustedSqft),
-      result.pitch,
-      result.pitchMultiplier,
-      result.overhangInches,
-      result.calibrationAdjustmentPercent,
-      result.buildEra,
-      result.houseType,
-      result.garagePolicy,
-      result.includedStructures,
-      result.excludedStructures,
-      result.confidence,
-      result.expectedErrorPercent,
-      result.flags.join("; "),
-      result.assumptions.join("; "),
-      result.status,
-    ]);
+    const rows = batchResults.map((result) => {
+      const override = overrides[result.id] ?? {};
+
+      return [
+        "City of Calgary Property Assessments API 4bsw-nn7w",
+        result.address.community,
+        result.address.address,
+        result.address.uniqueKey,
+        result.address.cpid,
+        result.address.rollNumber,
+        result.address.dwellingType,
+        result.address.classificationSource,
+        result.address.constructionYear ?? "",
+        result.address.ageBand,
+        result.address.landUse,
+        result.address.propertyType,
+        result.address.assessmentClass,
+        result.address.assessmentClassDescription,
+        result.address.subPropertyUse,
+        result.address.latitude ?? "",
+        result.address.longitude ?? "",
+        assumptions.pitch,
+        result.pitch,
+        result.overhangInches,
+        result.calibrationPercent,
+        result.detachedGaragePolicy,
+        result.attachedGaragePolicy,
+        result.wasteFactor,
+        override.notes ?? "",
+        Object.keys(override).length ? JSON.stringify(override) : "",
+        Math.round(result.buildingFootprintSqft),
+        Math.round(result.overhangFootprintSqft),
+        Math.round(result.roofSqft),
+        result.roofingSquares.toFixed(1),
+        Math.round(result.wasteAdjustedSqft),
+        result.confidence,
+        result.expectedErrorPercent,
+        result.includedStructures,
+        result.excludedStructures,
+        result.flags.join("; "),
+        result.assumptions.join("; "),
+        result.status,
+      ];
+    });
     const csv = [headers, ...rows]
       .map((row) => row.map((cell) => csvEscape(cell)).join(","))
       .join("\n");
@@ -1566,401 +1513,537 @@ export default function RoofCalibrationTool() {
     const link = document.createElement("a");
 
     link.href = url;
-    link.download = `${selectedCommunity.toLowerCase().replaceAll(" ", "-")}-roof-estimates.csv`;
+    link.download = `${selectedCommunity.toLowerCase().replaceAll(/[ /]+/g, "-")}-roof-estimates.csv`;
     link.click();
     URL.revokeObjectURL(url);
   };
 
-  const existingValue = parseOptionalPositive(existingToolSqft);
-  const existingInputInvalid = Number.isNaN(existingValue);
-  const wasteValue = Number(wasteFactor);
-  const wasteInvalid = !Number.isFinite(wasteValue) || wasteValue < 0 || wasteValue > 30;
-  const overhangValue = Number(overhangInches);
-  const overhangInvalid =
-    !Number.isFinite(overhangValue) || overhangValue < 0 || overhangValue > 36;
-  const calibrationValue = Number(calibrationAdjustmentPercent);
-  const calibrationInvalid =
-    !Number.isFinite(calibrationValue) || calibrationValue < -30 || calibrationValue > 30;
-  const currentCommunityProfile =
-    COMMUNITY_PROFILES.find((profile) => profile.community === selectedCommunity) ??
-    COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
-  const selectedBatchResult =
-    batchResults.find((result) => result.id === selectedBatchResultId) ?? null;
-
   return (
-    <main className="min-h-screen bg-[#f4f6f5] text-slate-900">
-      <div className="mx-auto flex w-full max-w-[1500px] flex-col gap-4 px-4 py-4 lg:px-6">
-        <header className="flex flex-col justify-between gap-3 border-b border-slate-200 pb-4 lg:flex-row lg:items-end">
+    <main className="min-h-screen bg-[#eef2ef] text-slate-950">
+      <div className="mx-auto flex w-full max-w-[1720px] flex-col gap-3 px-3 py-3 lg:px-4">
+        <header className="grid gap-3 border-b border-slate-300 pb-3 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
           <div>
-            <h1 className="text-2xl font-semibold tracking-normal text-slate-950">
+            <h1 className="text-2xl font-bold tracking-normal text-slate-950">
               Roof Sqft Calibration Tool
             </h1>
-            <p className="mt-1 text-sm text-slate-600">
-              Estimate a roof from map building data and compare it to an existing roof report.
+            <p className="mt-1 max-w-4xl text-sm font-medium text-slate-600">
+              Calgary community batch estimator using City of Calgary assessment parcels, inferred
+              R110/R120 dwelling type, Mapbox building footprints, and Turf area calculations.
             </p>
           </div>
-          <div className="grid grid-cols-3 gap-2 text-right">
-            <Metric label="Footprint" value={`${formatNumber(totals.totalFootprintSqft)} sqft`} />
-            <Metric label="Roof area" value={`${formatNumber(totals.totalRoofSurfaceSqft)} sqft`} />
-            <Metric label="Squares" value={formatNumber(totals.roofingSquares, 1)} />
+          <div className="grid grid-cols-2 gap-2 text-right md:grid-cols-4">
+            <Metric label="Eligible rows" value={formatNumber(eligibleAddresses.length)} />
+            <Metric label="Estimated" value={formatNumber(estimatedCount)} />
+            <Metric label="No footprint" value={formatNumber(noFootprintCount)} />
+            <Metric label="Batch squares" value={formatNumber(totals.squares, 1)} />
           </div>
         </header>
 
         {!mapboxToken ? (
-          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-medium text-amber-900">
-            NEXT_PUBLIC_MAPBOX_TOKEN is missing. Add it to .env.local and restart the dev server to enable automatic address estimates.
+          <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-900">
+            NEXT_PUBLIC_MAPBOX_TOKEN is missing. Add it to .env.local and restart the dev server to enable Mapbox footprint estimates.
           </div>
         ) : null}
 
-        <section className="grid gap-3 rounded-md border border-slate-200 bg-white p-3 shadow-sm xl:grid-cols-[1.4fr_0.8fr_0.7fr]">
-          <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-            Address
-            <div className="flex gap-2">
-              <input
-                value={address}
-                onChange={(event) => setAddress(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    void handleAddressSearch();
-                  }
-                }}
-                placeholder="123 Example Street NW, Calgary, AB"
-                className="min-h-10 flex-1 rounded-md border border-slate-300 px-3 text-sm font-normal normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-              />
-              <button
-                onClick={() => void handleAddressSearch()}
-                disabled={isSearching}
-                className="min-h-10 rounded-md bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
-              >
-                {isSearching ? "Estimating" : "Estimate"}
-              </button>
-            </div>
-            {searchError ? (
-              <span className="text-xs font-medium normal-case text-red-700">{searchError}</span>
-            ) : null}
-            {resolvedAddress ? (
-              <span className="text-xs font-medium normal-case text-slate-500">
-                Estimated for {resolvedAddress}
-              </span>
-            ) : null}
-            {autoEstimateMessage ? (
-              <span
-                className={`text-xs font-semibold normal-case ${
-                  calculatedFacets.length > 0 ? "text-emerald-700" : "text-amber-800"
-                }`}
-              >
-                {autoEstimateMessage}
-              </span>
-            ) : null}
-          </label>
+        <section className="grid gap-3 xl:grid-cols-[380px_minmax(0,1fr)_360px]">
+          <Panel title="1. Select community">
+            <div className="grid gap-3">
+              <label className="field-label">
+                Community
+                <select
+                  value={selectedCommunity}
+                  onChange={(event) => {
+                    setSelectedCommunity(event.target.value);
+                    setEligibleAddresses([]);
+                    setBatchResults([]);
+                    setSelectedAddressId(null);
+                    setAddressMessage("");
+                  }}
+                  disabled={isLoadingCommunities}
+                  className="control"
+                >
+                  {communitySummaries.map((summary) => (
+                    <option key={summary.community} value={summary.community}>
+                      {summary.community} ({formatNumber(summary.total)})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="text-xs font-semibold text-slate-600">{communityMessage}</p>
 
-          <div className="grid grid-cols-2 gap-3">
-            <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-              Existing tool sqft
-              <input
-                value={existingToolSqft}
-                onChange={(event) => setExistingToolSqft(event.target.value)}
-                inputMode="decimal"
-                placeholder="Optional"
-                className="min-h-10 rounded-md border border-slate-300 px-3 text-sm font-normal normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-              />
-              {existingInputInvalid ? (
-                <span className="text-xs font-medium normal-case text-red-700">
-                  Enter a positive number.
-                </span>
+              {selectedSummary ? (
+                <>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Readout label="Eligible homes" value={formatNumber(selectedSummary.total)} strong />
+                    <Readout
+                      label="Avg build year"
+                      value={
+                        selectedSummary.averageYear
+                          ? formatNumber(selectedSummary.averageYear)
+                          : "Unknown"
+                      }
+                    />
+                    <Readout
+                      label="Single detached"
+                      value={formatNumber(selectedSummary.singleDetachedCount)}
+                    />
+                    <Readout label="Duplexes" value={formatNumber(selectedSummary.duplexCount)} />
+                    <Readout
+                      label="Oldest row"
+                      value={selectedSummary.oldestYear ? String(selectedSummary.oldestYear) : "Unknown"}
+                    />
+                    <Readout
+                      label="Priority score"
+                      value={formatNumber(selectedSummary.priorityScore)}
+                    />
+                  </div>
+                  <AgeBreakdownTable summary={selectedSummary} />
+                </>
               ) : null}
-            </label>
+            </div>
+          </Panel>
 
-            <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-              Includes waste
+          <Panel title="2. Community parameters">
+            <div className="grid gap-3 md:grid-cols-4">
+              <label className="field-label">
+                Default pitch
+                <select
+                  value={assumptions.pitch}
+                  onChange={(event) => updateAssumptions("pitch", event.target.value as PitchValue)}
+                  className="control"
+                >
+                  {PITCH_OPTIONS.map((option) => (
+                    <option key={option.label} value={option.label}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="field-label">
+                Overhang inches
+                <input
+                  value={assumptions.overhangInches}
+                  onChange={(event) =>
+                    updateAssumptions("overhangInches", Number(event.target.value))
+                  }
+                  inputMode="decimal"
+                  className="control"
+                />
+              </label>
+              <label className="field-label">
+                Calibration percent
+                <input
+                  value={assumptions.calibrationPercent}
+                  onChange={(event) =>
+                    updateAssumptions("calibrationPercent", Number(event.target.value))
+                  }
+                  inputMode="decimal"
+                  className="control"
+                />
+              </label>
+              <label className="field-label">
+                Waste factor
+                <input
+                  value={assumptions.wasteFactor}
+                  onChange={(event) => updateAssumptions("wasteFactor", Number(event.target.value))}
+                  inputMode="decimal"
+                  className="control"
+                />
+              </label>
+              <label className="field-label">
+                Detached garage
+                <select
+                  value={assumptions.detachedGaragePolicy}
+                  onChange={(event) =>
+                    updateAssumptions("detachedGaragePolicy", event.target.value as GaragePolicy)
+                  }
+                  className="control"
+                >
+                  <option value="exclude">Exclude</option>
+                  <option value="include">Include</option>
+                  <option value="auto">Auto</option>
+                </select>
+              </label>
+              <label className="field-label">
+                Attached garage
+                <select
+                  value={assumptions.attachedGaragePolicy}
+                  onChange={(event) =>
+                    updateAssumptions(
+                      "attachedGaragePolicy",
+                      event.target.value as AttachedGaragePolicy,
+                    )
+                  }
+                  className="control"
+                >
+                  <option value="include">Include</option>
+                  <option value="exclude">Exclude</option>
+                </select>
+              </label>
+              <label className="field-label">
+                Include duplexes
+                <button
+                  type="button"
+                  onClick={() => updateAssumptions("includeDuplexes", !assumptions.includeDuplexes)}
+                  className={`control text-left font-bold ${
+                    assumptions.includeDuplexes ? "bg-emerald-50 text-emerald-800" : "bg-white"
+                  }`}
+                >
+                  {assumptions.includeDuplexes ? "Yes, include R120" : "No, R110 only"}
+                </button>
+              </label>
+              <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-600">
+                Exclusion rule: townhouse, rowhouse, condo, apartment, commercial, industrial,
+                multi-unit, and non-residential rows are excluded because only RE + R110/R120 rows
+                are loaded.
+              </div>
+            </div>
+          </Panel>
+
+          <Panel title="3. Load and run">
+            <div className="grid gap-2">
               <button
                 type="button"
-                onClick={() => setExistingToolIncludesWaste((value) => !value)}
-                className={`min-h-10 rounded-md border px-3 text-sm font-semibold normal-case ${
-                  existingToolIncludesWaste
-                    ? "border-blue-300 bg-blue-50 text-blue-800"
-                    : "border-slate-300 bg-white text-slate-700"
-                }`}
+                onClick={() => void loadEligibleAddresses()}
+                disabled={!selectedCommunity || isLoadingAddresses}
+                className="primary-button"
               >
-                {existingToolIncludesWaste ? "Yes" : "No"}
+                {isLoadingAddresses ? "Loading addresses" : "Load eligible addresses"}
               </button>
-            </label>
-          </div>
-
-          <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-            Notes
-            <textarea
-              value={notes}
-              onChange={(event) => setNotes(event.target.value)}
-              rows={3}
-              placeholder="Optional"
-              className="min-h-10 resize-none rounded-md border border-slate-300 px-3 py-2 text-sm font-normal normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-            />
-          </label>
-        </section>
-
-        <section className="grid gap-3 rounded-md border border-slate-200 bg-white p-3 shadow-sm xl:grid-cols-[360px_minmax(0,1fr)]">
-          <div className="grid gap-3">
-            <div>
-              <h2 className="text-base font-semibold text-slate-950">
-                Community Batch Estimator
-              </h2>
-              <p className="text-xs text-slate-500">
-                Run one Calgary community at a time with shared pitch, garage, and calibration assumptions.
-              </p>
-            </div>
-
-            <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-              Community profile
-              <select
-                value={selectedCommunity}
-                onChange={(event) => setSelectedCommunity(event.target.value)}
-                className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-              >
-                {COMMUNITY_PROFILES.map((profile) => (
-                  <option key={profile.community} value={profile.community}>
-                    {profile.community}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <div className="grid grid-cols-2 gap-2">
-              <Readout label="Build era" value={currentCommunityProfile.buildEra} />
-              <Readout label="House type" value={currentCommunityProfile.dominantHouseType} />
-              <Readout label="Pitch override" value={currentCommunityProfile.defaultPitch} />
-              <Readout
-                label="Expected error"
-                value={`+/- ${formatNumber(currentCommunityProfile.expectedErrorPercent)} percent`}
-              />
-              <Readout
-                label="Detached garage"
-                value={currentCommunityProfile.detachedGaragePolicy}
-              />
-              <Readout
-                label="Calibration"
-                value={`${formatNumber(currentCommunityProfile.calibrationAdjustmentPercent)} percent`}
-              />
-            </div>
-            <p className="rounded-md bg-slate-50 p-2 text-xs font-medium text-slate-600">
-              {currentCommunityProfile.notes}
-            </p>
-          </div>
-
-          <div className="grid gap-3">
-            <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-              Addresses
-              <textarea
-                value={batchAddresses}
-                onChange={(event) => setBatchAddresses(event.target.value)}
-                rows={7}
-                placeholder={"One address per line\n123 Sandstone Dr NW, Calgary, AB\n124 Sandstone Dr NW, Calgary, AB"}
-                className="resize-y rounded-md border border-slate-300 px-3 py-2 text-sm font-normal normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-              />
-            </label>
-
-            <div className="flex flex-wrap items-center gap-2">
               <button
+                type="button"
                 onClick={() => void runBatchEstimate()}
-                disabled={isBatchRunning}
-                className="h-10 rounded-md bg-slate-900 px-4 text-sm font-semibold text-white hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-400"
+                disabled={isBatchRunning || eligibleAddresses.length === 0 || !mapReady}
+                className="primary-button bg-slate-950 hover:bg-slate-700 disabled:bg-slate-400"
               >
-                {isBatchRunning ? "Running Batch" : "Run Batch Estimate"}
+                {isBatchRunning ? "Running batch estimate" : "Run batch estimate"}
               </button>
               <button
+                type="button"
                 onClick={exportBatchCsv}
                 disabled={batchResults.length === 0}
-                className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400"
+                className="secondary-button"
               >
-                Export Batch CSV
+                Export CSV
               </button>
-              {batchMessage ? (
-                <span className="text-xs font-semibold text-slate-600">{batchMessage}</span>
-              ) : null}
+              <p className="text-xs font-semibold text-slate-600">{addressMessage}</p>
+              <p className="text-xs font-semibold text-slate-600">{batchMessage}</p>
+            </div>
+          </Panel>
+        </section>
+
+        <section className="grid min-h-[680px] gap-3 xl:grid-cols-[minmax(0,1fr)_430px]">
+          <div className="grid gap-3">
+            <div className="overflow-hidden rounded-md border border-slate-300 bg-slate-200 shadow-sm">
+              {mapboxToken ? (
+                <div ref={mapContainerRef} className="h-[420px] w-full lg:h-[520px]" />
+              ) : (
+                <div className="flex h-[420px] items-center justify-center p-6 text-center text-sm font-semibold text-slate-600 lg:h-[520px]">
+                  Mapbox token required.
+                </div>
+              )}
             </div>
 
-            {batchResults.length > 0 ? (
-              <div className="max-h-[360px] overflow-auto rounded-md border border-slate-200">
-                <table className="w-full min-w-[1180px] border-collapse text-left text-xs">
-                  <thead className="sticky top-0 bg-slate-50 uppercase tracking-normal text-slate-500">
-                    <tr className="border-b border-slate-200">
+            <div className="flex flex-wrap gap-2 rounded-md border border-slate-200 bg-white p-2 text-xs font-bold text-slate-700 shadow-sm">
+              <LegendSwatch color="#991b1b" label="Pre-1950" />
+              <LegendSwatch color="#dc2626" label="1950-1969" />
+              <LegendSwatch color="#f97316" label="1970-1989" />
+              <LegendSwatch color="#eab308" label="1990-2009" />
+              <LegendSwatch color="#22c55e" label="2010+" />
+              <span className="ml-auto text-slate-500">Blue outlines mark duplex rows.</span>
+            </div>
+
+            <Panel title="Address table">
+              <div className="max-h-[480px] overflow-auto">
+                <table className="w-full min-w-[1320px] border-collapse text-left text-xs">
+                  <thead className="sticky top-0 z-10 bg-slate-50 uppercase tracking-normal text-slate-500">
+                    <tr className="border-y border-slate-200">
                       <TableHeader>Address</TableHeader>
+                      <TableHeader>Dwelling type</TableHeader>
+                      <TableHeader>Year</TableHeader>
+                      <TableHeader>Age band</TableHeader>
+                      <TableHeader>Land use</TableHeader>
                       <TableHeader>Roof sqft</TableHeader>
-                      <TableHeader>Pitch</TableHeader>
-                      <TableHeader>House type</TableHeader>
-                      <TableHeader>Garage policy</TableHeader>
+                      <TableHeader>Squares</TableHeader>
                       <TableHeader>Confidence</TableHeader>
-                      <TableHeader>Error</TableHeader>
+                      <TableHeader>Expected error</TableHeader>
                       <TableHeader>Flags</TableHeader>
                       <TableHeader>Status</TableHeader>
+                      <TableHeader>View</TableHeader>
                     </tr>
                   </thead>
                   <tbody>
+                    {batchResults.length === 0 ? (
+                      <tr>
+                        <td colSpan={12} className="px-3 py-7 text-center text-sm text-slate-500">
+                          Select a community and load eligible Calgary addresses. No pasted address
+                          list is needed.
+                        </td>
+                      </tr>
+                    ) : null}
                     {batchResults.map((result) => (
                       <tr
                         key={result.id}
-                        onClick={() => setSelectedBatchResultId(result.id)}
-                        className={`cursor-pointer border-b border-slate-100 ${
-                          selectedBatchResultId === result.id
-                            ? "bg-blue-50"
-                            : "hover:bg-slate-50"
+                        className={`border-b border-slate-100 ${
+                          selectedResult?.id === result.id ? "bg-cyan-50" : "hover:bg-slate-50"
                         }`}
                       >
                         <TableCell>
-                          <span className="block max-w-[300px] truncate font-semibold text-slate-900">
-                            {result.address}
+                          <span className="block max-w-[280px] truncate font-bold text-slate-950">
+                            {result.address.address}
                           </span>
                         </TableCell>
-                        <TableCell>{formatNumber(result.roofSqft)} sqft</TableCell>
-                        <TableCell>{result.pitch}</TableCell>
-                        <TableCell>{result.houseType}</TableCell>
-                        <TableCell>{result.garagePolicy}</TableCell>
-                        <TableCell>{result.confidence}</TableCell>
-                        <TableCell>+/- {formatNumber(result.expectedErrorPercent)}%</TableCell>
                         <TableCell>
-                          <span className="block max-w-[260px] truncate">
+                          <span
+                            className={`rounded-md border px-2 py-1 text-[11px] font-bold ${
+                              result.address.dwellingType === "Duplex"
+                                ? "border-blue-200 bg-blue-50 text-blue-800"
+                                : "border-slate-200 bg-white text-slate-700"
+                            }`}
+                          >
+                            {result.address.dwellingType}
+                          </span>
+                        </TableCell>
+                        <TableCell>{result.address.constructionYear ?? "Unknown"}</TableCell>
+                        <TableCell>{result.address.ageBand}</TableCell>
+                        <TableCell>{result.address.landUse || "Unknown"}</TableCell>
+                        <TableCell>{result.roofSqft ? `${formatNumber(result.roofSqft)} sqft` : "-"}</TableCell>
+                        <TableCell>{result.roofingSquares ? formatNumber(result.roofingSquares, 1) : "-"}</TableCell>
+                        <TableCell>{result.confidence}</TableCell>
+                        <TableCell>
+                          {result.expectedErrorPercent
+                            ? `+/- ${formatNumber(result.expectedErrorPercent)}%`
+                            : "-"}
+                        </TableCell>
+                        <TableCell>
+                          <span className="block max-w-[280px] truncate">
                             {result.flags.join("; ")}
                           </span>
                         </TableCell>
                         <TableCell>{result.status}</TableCell>
+                        <TableCell>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedAddressId(result.id)}
+                            className="secondary-button h-8 px-2 text-xs"
+                          >
+                            View
+                          </button>
+                        </TableCell>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-            ) : null}
+            </Panel>
+          </div>
 
-            {selectedBatchResult ? (
-              <div className="rounded-md border border-blue-200 bg-blue-50 p-3">
-                <div className="mb-3 flex flex-col justify-between gap-2 sm:flex-row sm:items-start">
+          <aside className="grid content-start gap-3">
+            <Panel title="Selected address">
+              {selectedResult ? (
+                <div className="grid gap-3">
                   <div>
-                    <h3 className="text-sm font-bold text-slate-950">
-                      {selectedBatchResult.address}
-                    </h3>
-                    <p className="text-xs font-medium text-slate-600">
-                      {selectedBatchResult.resolvedAddress || "No resolved address"}
+                    <h2 className="text-base font-bold text-slate-950">
+                      {selectedResult.address.address}
+                    </h2>
+                    <p className="text-xs font-semibold text-slate-600">
+                      {selectedResult.address.community} / {selectedResult.address.dwellingType} /{" "}
+                      {selectedResult.address.classificationSource}
                     </p>
                   </div>
-                  <span className="w-fit rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-bold text-slate-700">
-                    {selectedBatchResult.status}
-                  </span>
-                </div>
 
-                <div className="grid gap-2 md:grid-cols-4">
-                  <Readout
-                    label="Roof sqft"
-                    value={`${formatNumber(selectedBatchResult.roofSqft)} sqft`}
-                    strong
-                  />
-                  <Readout
-                    label="Squares"
-                    value={formatNumber(selectedBatchResult.roofingSquares, 1)}
-                  />
-                  <Readout
-                    label="Confidence"
-                    value={`${selectedBatchResult.confidence}, +/- ${formatNumber(
-                      selectedBatchResult.expectedErrorPercent,
-                    )}%`}
-                  />
-                  <Readout
-                    label="Structures"
-                    value={`${selectedBatchResult.includedStructures} in, ${selectedBatchResult.excludedStructures} out`}
-                  />
-                </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <Readout
+                      label="Roof sqft"
+                      value={`${formatNumber(selectedResult.roofSqft)} sqft`}
+                      strong
+                    />
+                    <Readout label="Roofing squares" value={formatNumber(selectedResult.roofingSquares, 1)} />
+                    <Readout
+                      label="Confidence"
+                      value={`${selectedResult.confidence} +/- ${formatNumber(
+                        selectedResult.expectedErrorPercent,
+                      )}%`}
+                    />
+                    <Readout
+                      label="Structures"
+                      value={`${selectedResult.includedStructures} in / ${selectedResult.excludedStructures} out`}
+                    />
+                  </div>
 
-                <div className="mt-3 grid gap-2 md:grid-cols-3">
-                  <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                    Pitch for included structures
-                    <select
-                      value={selectedBatchResult.pitch}
+                  <div className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs font-semibold text-slate-700">
+                    <p>Source: City of Calgary Property Assessments API 4bsw-nn7w.</p>
+                    <p>
+                      Land use {selectedResult.address.landUse || "unknown"}, assessment{" "}
+                      {selectedResult.address.assessmentClassDescription || "unknown"}, unique key{" "}
+                      {selectedResult.address.uniqueKey || "not supplied"}.
+                    </p>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="field-label">
+                      Pitch override
+                      <select
+                        value={selectedOverride.pitch ?? selectedResult.pitch}
+                        onChange={(event) =>
+                          updateOverride(selectedResult.id, {
+                            pitch: event.target.value as PitchValue,
+                          })
+                        }
+                        className="control"
+                      >
+                        {PITCH_OPTIONS.map((option) => (
+                          <option key={option.label} value={option.label}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field-label">
+                      Overhang
+                      <input
+                        value={selectedOverride.overhangInches ?? selectedResult.overhangInches}
+                        onChange={(event) =>
+                          updateOverride(selectedResult.id, {
+                            overhangInches: Number(event.target.value),
+                          })
+                        }
+                        inputMode="decimal"
+                        className="control"
+                      />
+                    </label>
+                    <label className="field-label">
+                      Calibration
+                      <input
+                        value={
+                          selectedOverride.calibrationPercent ?? selectedResult.calibrationPercent
+                        }
+                        onChange={(event) =>
+                          updateOverride(selectedResult.id, {
+                            calibrationPercent: Number(event.target.value),
+                          })
+                        }
+                        inputMode="decimal"
+                        className="control"
+                      />
+                    </label>
+                    <label className="field-label">
+                      Confidence
+                      <select
+                        value={selectedOverride.confidence ?? selectedResult.confidence}
+                        onChange={(event) =>
+                          updateOverride(selectedResult.id, {
+                            confidence: event.target.value as Confidence,
+                          })
+                        }
+                        className="control"
+                      >
+                        {["High", "Medium", "Low", "Unusable"].map((confidence) => (
+                          <option key={confidence} value={confidence}>
+                            {confidence}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="field-label">
+                      Detached garage
+                      <select
+                        value={
+                          selectedOverride.detachedGaragePolicy ??
+                          selectedResult.detachedGaragePolicy
+                        }
+                        onChange={(event) =>
+                          updateOverride(selectedResult.id, {
+                            detachedGaragePolicy: event.target.value as GaragePolicy,
+                          })
+                        }
+                        className="control"
+                      >
+                        <option value="exclude">Exclude</option>
+                        <option value="include">Include</option>
+                        <option value="auto">Auto</option>
+                      </select>
+                    </label>
+                    <label className="field-label">
+                      Attached garage
+                      <select
+                        value={
+                          selectedOverride.attachedGaragePolicy ??
+                          selectedResult.attachedGaragePolicy
+                        }
+                        onChange={(event) =>
+                          updateOverride(selectedResult.id, {
+                            attachedGaragePolicy: event.target.value as AttachedGaragePolicy,
+                          })
+                        }
+                        className="control"
+                      >
+                        <option value="include">Include</option>
+                        <option value="exclude">Exclude</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  <label className="field-label">
+                    Notes
+                    <textarea
+                      value={selectedOverride.notes ?? ""}
                       onChange={(event) =>
-                        updateBatchAllIncludedPitch(
-                          selectedBatchResult.id,
-                          event.target.value as PitchValue,
-                        )
+                        updateOverride(selectedResult.id, { notes: event.target.value })
                       }
-                      className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold normal-case text-slate-900"
-                    >
-                      {PITCH_OPTIONS.map((option) => (
-                        <option key={option.label} value={option.label}>
-                          {option.label}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                    Overhang inches
-                    <input
-                      value={selectedBatchResult.overhangInches}
-                      onChange={(event) =>
-                        updateBatchNumericOverride(
-                          selectedBatchResult.id,
-                          "overhangInches",
-                          event.target.value,
-                        )
-                      }
-                      inputMode="decimal"
-                      className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold normal-case text-slate-900"
+                      rows={3}
+                      className="control min-h-20 resize-y py-2"
+                      placeholder="Saved automatically to this browser"
                     />
                   </label>
-                  <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                    Calibration percent
-                    <input
-                      value={selectedBatchResult.calibrationAdjustmentPercent}
-                      onChange={(event) =>
-                        updateBatchNumericOverride(
-                          selectedBatchResult.id,
-                          "calibrationAdjustmentPercent",
-                          event.target.value,
-                        )
-                      }
-                      inputMode="decimal"
-                      className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold normal-case text-slate-900"
-                    />
-                  </label>
-                </div>
 
-                {selectedBatchResult.facets.length > 0 ? (
-                  <div className="mt-3 grid gap-2">
-                    {selectedBatchResult.facets.map((facet, index) => (
+                  <div className="grid gap-2">
+                    <h3 className="text-xs font-bold uppercase tracking-normal text-slate-500">
+                      Included/excluded roof structures
+                    </h3>
+                    {selectedResult.facets.length === 0 ? (
+                      <div className="rounded-md border border-amber-200 bg-amber-50 p-2 text-xs font-semibold text-amber-900">
+                        No Mapbox building footprint has been attached to this row yet.
+                      </div>
+                    ) : null}
+                    {selectedResult.facets.map((facet, index) => (
                       <div
                         key={facet.id}
-                        className="grid gap-2 rounded-md border border-slate-200 bg-white p-2 md:grid-cols-[1fr_90px_110px]"
+                        className="grid gap-2 rounded-md border border-slate-200 bg-white p-2"
                       >
-                        <div>
-                          <p className="text-xs font-bold text-slate-900">
-                            Structure {index + 1}: {facet.role}
-                          </p>
-                          <p className="text-[11px] font-medium text-slate-500">
-                            {facet.includeReason}
-                          </p>
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <p className="text-xs font-bold text-slate-950">
+                              Structure {index + 1}: {facet.role}
+                            </p>
+                            <p className="text-[11px] font-semibold text-slate-500">
+                              {facet.includeReason}
+                            </p>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateFacetOverride(selectedResult, facet.id, {
+                                included: !facet.included,
+                              })
+                            }
+                            className={`h-8 rounded-md border px-2 text-xs font-bold ${
+                              facet.included
+                                ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                                : "border-slate-200 bg-slate-50 text-slate-500"
+                            }`}
+                          >
+                            {facet.included ? "Included" : "Excluded"}
+                          </button>
                         </div>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateBatchFacet(selectedBatchResult.id, facet.id, {
-                              included: !facet.included,
-                              includeReason: facet.included
-                                ? "Excluded by row-level override."
-                                : "Included by row-level override.",
-                            })
-                          }
-                          className={`h-9 rounded-md border px-2 text-xs font-bold ${
-                            facet.included
-                              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                              : "border-slate-200 bg-white text-slate-500"
-                          }`}
-                        >
-                          {facet.included ? "Included" : "Excluded"}
-                        </button>
                         <select
                           value={facet.pitch}
                           onChange={(event) =>
-                            updateBatchFacet(selectedBatchResult.id, facet.id, {
+                            updateFacetOverride(selectedResult, facet.id, {
                               pitch: event.target.value as PitchValue,
                             })
                           }
-                          className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold text-slate-900"
+                          className="control h-8"
                         >
                           {PITCH_OPTIONS.map((option) => (
                             <option key={option.label} value={option.label}>
@@ -1971,430 +2054,30 @@ export default function RoofCalibrationTool() {
                       </div>
                     ))}
                   </div>
-                ) : (
-                  <p className="mt-3 rounded-md bg-white p-2 text-xs font-semibold text-amber-800">
-                    No footprint geometry is available for this row.
-                  </p>
-                )}
 
-                <div className="mt-3 rounded-md bg-white p-2">
-                  <p className="text-xs font-bold uppercase tracking-normal text-slate-500">
-                    Flags
-                  </p>
-                  <p className="text-xs font-medium text-slate-700">
-                    {selectedBatchResult.flags.join("; ")}
-                  </p>
-                  <p className="mt-2 text-xs font-bold uppercase tracking-normal text-slate-500">
-                    Assumptions
-                  </p>
-                  <p className="text-xs font-medium text-slate-700">
-                    {selectedBatchResult.assumptions.join("; ")}
-                  </p>
-                </div>
-              </div>
-            ) : null}
-          </div>
-        </section>
-
-        <section className="grid min-h-[620px] gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
-          <div className="overflow-hidden rounded-md border border-slate-300 bg-slate-200 shadow-sm">
-            {mapboxToken ? (
-              <div ref={mapContainerRef} className="h-[620px] w-full" />
-            ) : (
-              <div className="flex h-[620px] items-center justify-center bg-slate-100 p-6 text-center text-sm font-medium text-slate-600">
-                Mapbox token required. Add NEXT_PUBLIC_MAPBOX_TOKEN to .env.local.
-              </div>
-            )}
-          </div>
-
-          <aside className="flex min-h-[620px] flex-col gap-3">
-            <Panel title="Facets">
-              <div className="flex flex-col gap-2">
-                {calculatedFacets.length === 0 ? (
-                  <div className="rounded-md border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-600">
-                    Enter an address to estimate the roof footprint automatically. If no building footprint is available, the result will be marked unusable.
-                  </div>
-                ) : null}
-
-                {calculatedFacets.map((facet, index) => (
-                  <div
-                    key={facet.id}
-                    className="grid gap-2 rounded-md border border-slate-200 bg-slate-50 p-2"
-                  >
-                    <div className="flex items-center justify-between gap-2">
-                      <div>
-                        <span className="text-sm font-semibold text-slate-900">
-                          Structure {index + 1}
-                        </span>
-                        <p className="text-[11px] font-medium text-slate-500">
-                          {facet.role}
-                          {facet.distanceFromAddressMeters !== null
-                            ? `, ${formatNumber(facet.distanceFromAddressMeters, 0)} m away`
-                            : ""}
-                        </p>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => updateFacetIncluded(facet.id, !facet.included)}
-                          className={`rounded-md border px-2 py-1 text-xs font-bold ${
-                            facet.included
-                              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
-                              : "border-slate-200 bg-white text-slate-500"
-                          }`}
-                        >
-                          {facet.included ? "Included" : "Excluded"}
-                        </button>
-                        <button
-                          onClick={() => deleteFacet(facet.id)}
-                          className="rounded-md border border-red-200 bg-white px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-50"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </div>
-                    <p className="rounded-md bg-white px-2 py-1 text-[11px] font-medium text-slate-600">
-                      {facet.includeReason}
-                    </p>
-
-                    <div className="grid grid-cols-2 gap-2 text-xs">
-                      <Readout
-                        label="Building footprint"
-                        value={`${formatNumber(facet.buildingFootprintSqft)} sqft`}
-                      />
-                      <Readout
-                        label="With overhang"
-                        value={`${formatNumber(facet.footprintSqft)} sqft`}
-                      />
-                      <Readout
-                        label="Roof surface"
-                        value={`${formatNumber(facet.roofSurfaceSqft)} sqft`}
-                      />
-                      <Readout label="Included" value={facet.included ? "Yes" : "No"} />
-                    </div>
-
-                    <div className="grid grid-cols-[1fr_0.75fr] gap-2">
-                      <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                        Pitch
-                        <select
-                          value={facet.pitch}
-                          onChange={(event) =>
-                            updateFacetPitch(facet.id, event.target.value as PitchValue)
-                          }
-                          className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-medium normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-                        >
-                          {PITCH_OPTIONS.map((option) => (
-                            <option key={option.label} value={option.label}>
-                              {option.label}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                      <Readout
-                        label="Multiplier"
-                        value={formatNumber(facet.pitchMultiplier, 3)}
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </Panel>
-
-            <Panel title="Accuracy Engine">
-              {autoRoofProfile ? (
-                <div className="grid gap-2">
-                  <div className="grid grid-cols-2 gap-2">
-                    <Readout label="Auto profile" value={autoRoofProfile.label} strong />
-                    <Readout
-                      label="Expected error"
-                      value={`+/- ${formatNumber(autoRoofProfile.expectedErrorPercent)} percent`}
-                      strong
-                    />
-                    <Readout label="Auto pitch" value={autoRoofProfile.pitch} />
-                    <Readout
-                      label="Auto adjustment"
-                      value={`${formatNumber(autoRoofProfile.calibrationAdjustmentPercent)} percent`}
-                    />
-                  </div>
                   <div className="rounded-md border border-slate-200 bg-slate-50 p-2">
-                    {autoRoofProfile.reasons.map((reason) => (
-                      <p key={reason} className="text-xs font-medium text-slate-600">
-                        {reason}
-                      </p>
-                    ))}
-                    <p className="mt-1 text-xs font-semibold text-slate-700">
-                      This is still footprint-based, not AI roof-plane segmentation.
+                    <p className="text-xs font-bold uppercase tracking-normal text-slate-500">
+                      Flags
+                    </p>
+                    <p className="text-xs font-semibold text-slate-700">
+                      {selectedResult.flags.join("; ")}
+                    </p>
+                    <p className="mt-2 text-xs font-bold uppercase tracking-normal text-slate-500">
+                      Assumptions
+                    </p>
+                    <p className="text-xs font-semibold text-slate-700">
+                      {selectedResult.assumptions.join("; ")}
                     </p>
                   </div>
                 </div>
               ) : (
-                <p className="text-sm text-slate-600">
-                  Estimate an address to generate an automatic roof profile, confidence band, and adjustment reasons.
+                <p className="text-sm font-medium text-slate-600">
+                  Load a community and select an address row to inspect source data, assumptions,
+                  structures, and overrides.
                 </p>
               )}
             </Panel>
-
-            <Panel title="Output Summary">
-              <div className="grid grid-cols-2 gap-2">
-                <Readout
-                  label="Building footprint"
-                  value={`${formatNumber(totals.totalBuildingFootprintSqft)} sqft`}
-                />
-                <Readout
-                  label="With overhang"
-                  value={`${formatNumber(totals.totalFootprintSqft)} sqft`}
-                  strong
-                />
-                <label className="flex flex-col gap-1 rounded-md border border-slate-200 bg-white p-2 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                  Overhang inches
-                  <input
-                    value={overhangInches}
-                    onChange={(event) => setOverhangInches(event.target.value)}
-                    inputMode="decimal"
-                    className={`h-8 rounded-md border px-2 text-sm font-semibold normal-case text-slate-900 outline-none focus:ring-2 ${
-                      overhangInvalid
-                        ? "border-red-300 focus:border-red-500 focus:ring-red-100"
-                        : "border-slate-300 focus:border-blue-500 focus:ring-blue-100"
-                    }`}
-                  />
-                </label>
-                <Readout
-                  label="Base roof surface"
-                  value={`${formatNumber(totals.baseRoofSurfaceSqft)} sqft`}
-                />
-                <label className="flex flex-col gap-1 rounded-md border border-slate-200 bg-white p-2 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                  Calibration percent
-                  <input
-                    value={calibrationAdjustmentPercent}
-                    onChange={(event) => setCalibrationAdjustmentPercent(event.target.value)}
-                    inputMode="decimal"
-                    className={`h-8 rounded-md border px-2 text-sm font-semibold normal-case text-slate-900 outline-none focus:ring-2 ${
-                      calibrationInvalid
-                        ? "border-red-300 focus:border-red-500 focus:ring-red-100"
-                        : "border-slate-300 focus:border-blue-500 focus:ring-blue-100"
-                    }`}
-                  />
-                </label>
-                <Readout
-                  label="Calibrated roof"
-                  value={`${formatNumber(totals.totalRoofSurfaceSqft)} sqft`}
-                  strong
-                />
-                <Readout
-                  label="Roofing squares"
-                  value={formatNumber(totals.roofingSquares, 1)}
-                />
-                <label className="flex flex-col gap-1 rounded-md border border-slate-200 bg-white p-2 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                  Waste factor
-                  <input
-                    value={wasteFactor}
-                    onChange={(event) => setWasteFactor(event.target.value)}
-                    inputMode="decimal"
-                    className={`h-8 rounded-md border px-2 text-sm font-semibold normal-case text-slate-900 outline-none focus:ring-2 ${
-                      wasteInvalid
-                        ? "border-red-300 focus:border-red-500 focus:ring-red-100"
-                        : "border-slate-300 focus:border-blue-500 focus:ring-blue-100"
-                    }`}
-                  />
-                </label>
-                <Readout
-                  label="Waste adjusted"
-                  value={`${formatNumber(totals.wasteAdjustedSqft)} sqft`}
-                />
-                <Readout
-                  label="Waste squares"
-                  value={formatNumber(totals.wasteAdjustedRoofingSquares, 1)}
-                />
-              </div>
-              {wasteInvalid ? (
-                <p className="mt-2 text-xs font-medium text-red-700">
-                  Waste factor must be between 0 and 30 percent.
-                </p>
-              ) : null}
-              {overhangInvalid ? (
-                <p className="mt-2 text-xs font-medium text-red-700">
-                  Overhang must be between 0 and 36 inches.
-                </p>
-              ) : null}
-              {calibrationInvalid ? (
-                <p className="mt-2 text-xs font-medium text-red-700">
-                  Calibration adjustment must be between -30 and 30 percent.
-                </p>
-              ) : null}
-            </Panel>
-
-            <Panel title="Comparison">
-              {comparison ? (
-                <div className="grid gap-2">
-                  <div className="grid grid-cols-2 gap-2">
-                    <Readout
-                      label="Existing tool"
-                      value={`${formatNumber(comparison.existing)} sqft`}
-                    />
-                    <Readout
-                      label="Our calibrated"
-                      value={`${formatNumber(totals.totalRoofSurfaceSqft)} sqft`}
-                    />
-                    <Readout
-                      label="Difference"
-                      value={`${formatNumber(comparison.differenceSqft)} sqft`}
-                      strong
-                    />
-                    <Readout
-                      label="Difference percent"
-                      value={`${formatNumber(comparison.differencePercent, 1)} percent`}
-                      strong
-                    />
-                  </div>
-                  <span
-                    className={`w-fit rounded-md border px-2 py-1 text-xs font-bold ${getStatusClasses(
-                      comparison.status,
-                    )}`}
-                  >
-                    {comparison.status}
-                  </span>
-                </div>
-              ) : (
-                <p className="text-sm text-slate-600">
-                  Enter existing tool sqft to compare against the calculated roof surface area.
-                </p>
-              )}
-            </Panel>
-
-            <Panel title="Confidence">
-              <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
-                Manual confidence
-                <select
-                  value={confidence}
-                  onChange={(event) => setConfidence(event.target.value as Confidence)}
-                  className="h-10 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold normal-case text-slate-900 outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100"
-                >
-                  {Object.keys(CONFIDENCE_HELP).map((option) => (
-                    <option key={option} value={option}>
-                      {option}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <p className="mt-2 text-xs font-medium text-slate-600">
-                {CONFIDENCE_HELP[confidence]}
-              </p>
-            </Panel>
-
-            <div className="rounded-md border border-slate-200 bg-white p-3 shadow-sm">
-              <button
-                onClick={saveMeasurement}
-                className="h-11 w-full rounded-md bg-blue-700 px-4 text-sm font-bold text-white hover:bg-blue-800"
-              >
-                Save Measurement
-              </button>
-              {saveMessage ? (
-                <p
-                  className={`mt-2 text-xs font-semibold ${
-                    saveMessage === "Measurement saved." ||
-                    saveMessage === "Loaded saved measurement."
-                      ? "text-emerald-700"
-                      : "text-red-700"
-                  }`}
-                >
-                  {saveMessage}
-                </p>
-              ) : null}
-            </div>
           </aside>
-        </section>
-
-        <section className="rounded-md border border-slate-200 bg-white p-3 shadow-sm">
-          <div className="mb-3 flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
-            <div>
-              <h2 className="text-base font-semibold text-slate-950">Saved Measurements</h2>
-              <p className="text-xs text-slate-500">
-                Stored in this browser for MVP calibration work.
-              </p>
-            </div>
-            <button
-              onClick={exportCsv}
-              disabled={savedMeasurements.length === 0}
-              className="h-9 rounded-md border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400"
-            >
-              Export CSV
-            </button>
-          </div>
-
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[980px] border-collapse text-left text-sm">
-              <thead>
-                <tr className="border-y border-slate-200 bg-slate-50 text-xs uppercase tracking-normal text-slate-500">
-                  <TableHeader>Address</TableHeader>
-                  <TableHeader>Our sqft</TableHeader>
-                  <TableHeader>Existing tool sqft</TableHeader>
-                  <TableHeader>Difference percent</TableHeader>
-                  <TableHeader>Status</TableHeader>
-                  <TableHeader>Confidence</TableHeader>
-                  <TableHeader>Created date</TableHeader>
-                  <TableHeader>View</TableHeader>
-                  <TableHeader>Delete</TableHeader>
-                </tr>
-              </thead>
-              <tbody>
-                {savedMeasurements.length === 0 ? (
-                  <tr>
-                    <td colSpan={9} className="px-3 py-6 text-center text-sm text-slate-500">
-                      No saved measurements yet.
-                    </td>
-                  </tr>
-                ) : null}
-
-                {savedMeasurements.map((measurement) => (
-                  <tr key={measurement.id} className="border-b border-slate-100">
-                    <TableCell>
-                      <span className="block max-w-[360px] truncate font-medium text-slate-900">
-                        {measurement.address}
-                      </span>
-                    </TableCell>
-                    <TableCell>{formatNumber(measurement.totalRoofSurfaceSqft)} sqft</TableCell>
-                    <TableCell>
-                      {measurement.existingToolSqft
-                        ? `${formatNumber(measurement.existingToolSqft)} sqft`
-                        : "Not entered"}
-                    </TableCell>
-                    <TableCell>
-                      {measurement.differencePercent === null
-                        ? "Not compared"
-                        : `${formatNumber(measurement.differencePercent, 1)} percent`}
-                    </TableCell>
-                    <TableCell>
-                      <span
-                        className={`rounded-md border px-2 py-1 text-xs font-bold ${getStatusClasses(
-                          measurement.status,
-                        )}`}
-                      >
-                        {measurement.status ?? "None"}
-                      </span>
-                    </TableCell>
-                    <TableCell>{measurement.confidence}</TableCell>
-                    <TableCell>{new Date(measurement.createdAt).toLocaleString()}</TableCell>
-                    <TableCell>
-                      <button
-                        onClick={() => viewMeasurement(measurement)}
-                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-800 hover:bg-slate-50"
-                      >
-                        View
-                      </button>
-                    </TableCell>
-                    <TableCell>
-                      <button
-                        onClick={() => deleteMeasurement(measurement.id)}
-                        className="rounded-md border border-red-200 bg-white px-2 py-1 text-xs font-semibold text-red-700 hover:bg-red-50"
-                      >
-                        Delete
-                      </button>
-                    </TableCell>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         </section>
       </div>
     </main>
@@ -2404,7 +2087,7 @@ export default function RoofCalibrationTool() {
 function Panel({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <section className="rounded-md border border-slate-200 bg-white p-3 shadow-sm">
-      <h2 className="mb-2 text-sm font-bold uppercase tracking-normal text-slate-700">
+      <h2 className="mb-2 text-xs font-bold uppercase tracking-normal text-slate-600">
         {title}
       </h2>
       {children}
@@ -2454,4 +2137,38 @@ function TableHeader({ children }: { children: React.ReactNode }) {
 
 function TableCell({ children }: { children: React.ReactNode }) {
   return <td className="px-3 py-2 align-middle text-slate-700">{children}</td>;
+}
+
+function LegendSwatch({ color, label }: { color: string; label: string }) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className="h-3 w-3 rounded-sm border border-slate-300" style={{ background: color }} />
+      {label}
+    </span>
+  );
+}
+
+function AgeBreakdownTable({ summary }: { summary: CommunitySummary }) {
+  return (
+    <div className="overflow-hidden rounded-md border border-slate-200">
+      <table className="w-full border-collapse text-left text-xs">
+        <thead className="bg-slate-50 uppercase tracking-normal text-slate-500">
+          <tr>
+            <TableHeader>Age band</TableHeader>
+            <TableHeader>Detached</TableHeader>
+            <TableHeader>Duplex</TableHeader>
+          </tr>
+        </thead>
+        <tbody>
+          {AGE_BANDS.map((band) => (
+            <tr key={band} className="border-t border-slate-100">
+              <TableCell>{band}</TableCell>
+              <TableCell>{formatNumber(summary.ageTypeBreakdown[band]["Single detached"])}</TableCell>
+              <TableCell>{formatNumber(summary.ageTypeBreakdown[band].Duplex)}</TableCell>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
