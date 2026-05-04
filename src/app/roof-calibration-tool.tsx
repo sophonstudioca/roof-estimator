@@ -135,6 +135,7 @@ type BatchResult = {
   expectedErrorPercent: number;
   flags: string[];
   assumptions: string[];
+  facets: Facet[];
   status: "Estimated" | "No footprint" | "Error";
 };
 
@@ -521,6 +522,53 @@ function flagsForEstimate(facets: Facet[], profile: CommunityProfile, expectedEr
   return flags.length > 0 ? flags : ["standard community assumptions"];
 }
 
+function recalculateBatchResult(
+  result: BatchResult,
+  facets: Facet[],
+  overrides: Partial<Pick<BatchResult, "overhangInches" | "calibrationAdjustmentPercent">> = {},
+): BatchResult {
+  const profile =
+    COMMUNITY_PROFILES.find((item) => item.community === result.community) ??
+    COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
+  const overhangInches = overrides.overhangInches ?? result.overhangInches;
+  const calibrationAdjustmentPercent =
+    overrides.calibrationAdjustmentPercent ?? result.calibrationAdjustmentPercent;
+  const summary = summarizeFacets({
+    facets,
+    overhangInches,
+    calibrationAdjustmentPercent,
+    wasteFactor: 0,
+  });
+  const expectedErrorPercent =
+    profile.expectedErrorPercent +
+    (summary.excludedStructures > 2 ? 4 : 0) +
+    (summary.includedStructures === 0 ? 50 : 0);
+
+  return {
+    ...result,
+    facets,
+    buildingFootprintSqft: summary.buildingFootprintSqft,
+    overhangFootprintSqft: summary.overhangFootprintSqft,
+    roofSqft: summary.roofSqft,
+    roofingSquares: summary.roofingSquares,
+    wasteAdjustedSqft: summary.wasteAdjustedSqft,
+    overhangInches,
+    calibrationAdjustmentPercent,
+    includedStructures: summary.includedStructures,
+    excludedStructures: summary.excludedStructures,
+    pitch: facets.find((facet) => facet.included)?.pitch ?? result.pitch,
+    pitchMultiplier: pitchMultiplierFor(facets.find((facet) => facet.included)?.pitch ?? result.pitch),
+    confidence: expectedErrorPercent > 20 ? "Low" : profile.confidence,
+    expectedErrorPercent,
+    flags: flagsForEstimate(facets, profile, expectedErrorPercent),
+    assumptions: [
+      profile.notes,
+      `Overrides now use ${facets.find((facet) => facet.included)?.pitch ?? result.pitch} pitch, ${overhangInches} inch overhang, ${calibrationAdjustmentPercent} percent calibration.`,
+      ...facets.map((facet) => `${facet.role}: ${facet.includeReason}`),
+    ],
+  };
+}
+
 function waitForMapIdle(map: mapboxgl.Map) {
   return new Promise<void>((resolve) => {
     if (map.loaded() && !map.isMoving()) {
@@ -687,6 +735,7 @@ export default function RoofCalibrationTool() {
   const [selectedCommunity, setSelectedCommunity] = useState("Sandstone Valley");
   const [batchAddresses, setBatchAddresses] = useState("");
   const [batchResults, setBatchResults] = useState<BatchResult[]>([]);
+  const [selectedBatchResultId, setSelectedBatchResultId] = useState<string | null>(null);
   const [batchMessage, setBatchMessage] = useState("");
   const [isBatchRunning, setIsBatchRunning] = useState(false);
 
@@ -1008,6 +1057,7 @@ export default function RoofCalibrationTool() {
 
     setBatchMessage("");
     setBatchResults([]);
+    setSelectedBatchResultId(null);
 
     if (addresses.length === 0) {
       setBatchMessage("Paste at least one address, one per line.");
@@ -1068,6 +1118,7 @@ export default function RoofCalibrationTool() {
             expectedErrorPercent: 100,
             flags: ["geocode failed"],
             assumptions: [profile.notes],
+            facets: [],
             status: "Error",
           });
           setBatchResults([...results]);
@@ -1106,6 +1157,7 @@ export default function RoofCalibrationTool() {
             expectedErrorPercent: 100,
             flags: ["no building footprint"],
             assumptions: [estimate.reason, profile.notes],
+            facets: [],
             status: "No footprint",
           });
           setBatchResults([...results]);
@@ -1154,6 +1206,7 @@ export default function RoofCalibrationTool() {
             `Community profile used ${profile.defaultPitch} pitch, ${profile.defaultOverhangInches} inch overhang, ${profile.calibrationAdjustmentPercent} percent calibration.`,
             ...profiledFacets.map((facet) => `${facet.role}: ${facet.includeReason}`),
           ],
+          facets: profiledFacets,
           status: "Estimated",
         });
         setBatchResults([...results]);
@@ -1183,6 +1236,7 @@ export default function RoofCalibrationTool() {
           expectedErrorPercent: 100,
           flags: ["estimate failed"],
           assumptions: [profile.notes],
+          facets: [],
           status: "Error",
         });
         setBatchResults([...results]);
@@ -1205,6 +1259,44 @@ export default function RoofCalibrationTool() {
       currentFacets.map((facet) => (facet.id === id ? { ...facet, included } : facet)),
     );
     setSaveMessage("");
+  };
+
+  const updateBatchResult = (id: string, updater: (result: BatchResult) => BatchResult) => {
+    setBatchResults((currentResults) =>
+      currentResults.map((result) => (result.id === id ? updater(result) : result)),
+    );
+  };
+
+  const updateBatchAllIncludedPitch = (id: string, pitch: PitchValue) => {
+    updateBatchResult(id, (result) =>
+      recalculateBatchResult(
+        result,
+        result.facets.map((facet) => (facet.included ? { ...facet, pitch } : facet)),
+      ),
+    );
+  };
+
+  const updateBatchFacet = (id: string, facetId: string, patch: Partial<Facet>) => {
+    updateBatchResult(id, (result) =>
+      recalculateBatchResult(
+        result,
+        result.facets.map((facet) => (facet.id === facetId ? { ...facet, ...patch } : facet)),
+      ),
+    );
+  };
+
+  const updateBatchNumericOverride = (
+    id: string,
+    key: "overhangInches" | "calibrationAdjustmentPercent",
+    value: string,
+  ) => {
+    const numericValue = Number(value);
+
+    if (!Number.isFinite(numericValue)) {
+      return;
+    }
+
+    updateBatchResult(id, (result) => recalculateBatchResult(result, result.facets, { [key]: numericValue }));
   };
 
   const deleteFacet = (id: string) => {
@@ -1492,6 +1584,8 @@ export default function RoofCalibrationTool() {
   const currentCommunityProfile =
     COMMUNITY_PROFILES.find((profile) => profile.community === selectedCommunity) ??
     COMMUNITY_PROFILES[COMMUNITY_PROFILES.length - 1];
+  const selectedBatchResult =
+    batchResults.find((result) => result.id === selectedBatchResultId) ?? null;
 
   return (
     <main className="min-h-screen bg-[#f4f6f5] text-slate-900">
@@ -1703,7 +1797,15 @@ export default function RoofCalibrationTool() {
                   </thead>
                   <tbody>
                     {batchResults.map((result) => (
-                      <tr key={result.id} className="border-b border-slate-100">
+                      <tr
+                        key={result.id}
+                        onClick={() => setSelectedBatchResultId(result.id)}
+                        className={`cursor-pointer border-b border-slate-100 ${
+                          selectedBatchResultId === result.id
+                            ? "bg-blue-50"
+                            : "hover:bg-slate-50"
+                        }`}
+                      >
                         <TableCell>
                           <span className="block max-w-[300px] truncate font-semibold text-slate-900">
                             {result.address}
@@ -1725,6 +1827,170 @@ export default function RoofCalibrationTool() {
                     ))}
                   </tbody>
                 </table>
+              </div>
+            ) : null}
+
+            {selectedBatchResult ? (
+              <div className="rounded-md border border-blue-200 bg-blue-50 p-3">
+                <div className="mb-3 flex flex-col justify-between gap-2 sm:flex-row sm:items-start">
+                  <div>
+                    <h3 className="text-sm font-bold text-slate-950">
+                      {selectedBatchResult.address}
+                    </h3>
+                    <p className="text-xs font-medium text-slate-600">
+                      {selectedBatchResult.resolvedAddress || "No resolved address"}
+                    </p>
+                  </div>
+                  <span className="w-fit rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-bold text-slate-700">
+                    {selectedBatchResult.status}
+                  </span>
+                </div>
+
+                <div className="grid gap-2 md:grid-cols-4">
+                  <Readout
+                    label="Roof sqft"
+                    value={`${formatNumber(selectedBatchResult.roofSqft)} sqft`}
+                    strong
+                  />
+                  <Readout
+                    label="Squares"
+                    value={formatNumber(selectedBatchResult.roofingSquares, 1)}
+                  />
+                  <Readout
+                    label="Confidence"
+                    value={`${selectedBatchResult.confidence}, +/- ${formatNumber(
+                      selectedBatchResult.expectedErrorPercent,
+                    )}%`}
+                  />
+                  <Readout
+                    label="Structures"
+                    value={`${selectedBatchResult.includedStructures} in, ${selectedBatchResult.excludedStructures} out`}
+                  />
+                </div>
+
+                <div className="mt-3 grid gap-2 md:grid-cols-3">
+                  <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
+                    Pitch for included structures
+                    <select
+                      value={selectedBatchResult.pitch}
+                      onChange={(event) =>
+                        updateBatchAllIncludedPitch(
+                          selectedBatchResult.id,
+                          event.target.value as PitchValue,
+                        )
+                      }
+                      className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold normal-case text-slate-900"
+                    >
+                      {PITCH_OPTIONS.map((option) => (
+                        <option key={option.label} value={option.label}>
+                          {option.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
+                    Overhang inches
+                    <input
+                      value={selectedBatchResult.overhangInches}
+                      onChange={(event) =>
+                        updateBatchNumericOverride(
+                          selectedBatchResult.id,
+                          "overhangInches",
+                          event.target.value,
+                        )
+                      }
+                      inputMode="decimal"
+                      className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold normal-case text-slate-900"
+                    />
+                  </label>
+                  <label className="flex flex-col gap-1 text-xs font-semibold uppercase tracking-normal text-slate-500">
+                    Calibration percent
+                    <input
+                      value={selectedBatchResult.calibrationAdjustmentPercent}
+                      onChange={(event) =>
+                        updateBatchNumericOverride(
+                          selectedBatchResult.id,
+                          "calibrationAdjustmentPercent",
+                          event.target.value,
+                        )
+                      }
+                      inputMode="decimal"
+                      className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold normal-case text-slate-900"
+                    />
+                  </label>
+                </div>
+
+                {selectedBatchResult.facets.length > 0 ? (
+                  <div className="mt-3 grid gap-2">
+                    {selectedBatchResult.facets.map((facet, index) => (
+                      <div
+                        key={facet.id}
+                        className="grid gap-2 rounded-md border border-slate-200 bg-white p-2 md:grid-cols-[1fr_90px_110px]"
+                      >
+                        <div>
+                          <p className="text-xs font-bold text-slate-900">
+                            Structure {index + 1}: {facet.role}
+                          </p>
+                          <p className="text-[11px] font-medium text-slate-500">
+                            {facet.includeReason}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateBatchFacet(selectedBatchResult.id, facet.id, {
+                              included: !facet.included,
+                              includeReason: facet.included
+                                ? "Excluded by row-level override."
+                                : "Included by row-level override.",
+                            })
+                          }
+                          className={`h-9 rounded-md border px-2 text-xs font-bold ${
+                            facet.included
+                              ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                              : "border-slate-200 bg-white text-slate-500"
+                          }`}
+                        >
+                          {facet.included ? "Included" : "Excluded"}
+                        </button>
+                        <select
+                          value={facet.pitch}
+                          onChange={(event) =>
+                            updateBatchFacet(selectedBatchResult.id, facet.id, {
+                              pitch: event.target.value as PitchValue,
+                            })
+                          }
+                          className="h-9 rounded-md border border-slate-300 bg-white px-2 text-sm font-semibold text-slate-900"
+                        >
+                          {PITCH_OPTIONS.map((option) => (
+                            <option key={option.label} value={option.label}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-3 rounded-md bg-white p-2 text-xs font-semibold text-amber-800">
+                    No footprint geometry is available for this row.
+                  </p>
+                )}
+
+                <div className="mt-3 rounded-md bg-white p-2">
+                  <p className="text-xs font-bold uppercase tracking-normal text-slate-500">
+                    Flags
+                  </p>
+                  <p className="text-xs font-medium text-slate-700">
+                    {selectedBatchResult.flags.join("; ")}
+                  </p>
+                  <p className="mt-2 text-xs font-bold uppercase tracking-normal text-slate-500">
+                    Assumptions
+                  </p>
+                  <p className="text-xs font-medium text-slate-700">
+                    {selectedBatchResult.assumptions.join("; ")}
+                  </p>
+                </div>
               </div>
             ) : null}
           </div>
